@@ -93,13 +93,12 @@ func DecodeFrame(r io.Reader) (Frame, error) {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
-	// verify crc
-	// crc covers header + payload (everything except the crc itself)
-	crcBuf := make([]byte, FrameHeaderSize+int(payloadLen))
-	copy(crcBuf, header)
-	copy(crcBuf[FrameHeaderSize:], rest[:payloadLen])
-
-	expected := crc32.ChecksumIEEE(crcBuf)
+	// verify crc - computed incrementally over header + payload
+	// to avoid allocating a copy of the entire frame
+	h := crc32.NewIEEE()
+	h.Write(header)
+	h.Write(rest[:payloadLen])
+	expected := h.Sum32()
 	got := binary.BigEndian.Uint32(rest[payloadLen:])
 	if got != expected {
 		return Frame{}, fmt.Errorf("crc mismatch: expected 0x%08X, got 0x%08X", expected, got)
@@ -160,7 +159,9 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 		return nil
 	}
 
-	var result []byte
+	// pre-allocate with a reasonable estimate to avoid per-run allocations
+	result := make([]byte, 0, 256*5)
+	var run [5]byte
 	currentBit := (bitmap[0] >> 7) & 1
 	count := uint32(0)
 
@@ -176,10 +177,9 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 			count++
 		} else {
 			// flush run
-			buf := make([]byte, 5)
-			binary.BigEndian.PutUint32(buf[0:4], count)
-			buf[4] = currentBit
-			result = append(result, buf...)
+			binary.BigEndian.PutUint32(run[0:4], count)
+			run[4] = currentBit
+			result = append(result, run[:]...)
 			currentBit = bit
 			count = 1
 		}
@@ -187,10 +187,9 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 
 	// flush final run
 	if count > 0 {
-		buf := make([]byte, 5)
-		binary.BigEndian.PutUint32(buf[0:4], count)
-		buf[4] = currentBit
-		result = append(result, buf...)
+		binary.BigEndian.PutUint32(run[0:4], count)
+		run[4] = currentBit
+		result = append(result, run[:]...)
 	}
 
 	return result
