@@ -3,7 +3,6 @@ package replproto
 import (
 	"bytes"
 	"compress/flate"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
@@ -18,13 +17,34 @@ var compressorPool = sync.Pool{
 	},
 }
 
-// CompressBlock compresses a block using flate level 1 (fastest).
+// CompressBlock compresses a block using the best available method.
 // returns nil if the block is all zeros (zero-block optimization).
+// for blocks with large zero regions (sparse), uses sparse encoding which
+// skips zero runs entirely. otherwise uses flate level 1 compression.
 func CompressBlock(data []byte) ([]byte, error) {
 	if IsZeroBlock(data) {
 		return nil, nil // zero block - no data to send
 	}
 
+	// try sparse encoding first - beneficial for VM disks, database files,
+	// and NTFS sparse files where allocated blocks contain large zero regions
+	if sparse := trySparseEncode(data); sparse != nil {
+		// compare sparse size with flate to pick the smaller one
+		flateData, err := flateCompress(data)
+		if err != nil {
+			return sparse, nil // flate failed, use sparse
+		}
+		if len(sparse) < len(flateData) {
+			return sparse, nil
+		}
+		return flateData, nil
+	}
+
+	return flateCompress(data)
+}
+
+// flateCompress compresses data using flate level 1 (fastest)
+func flateCompress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	w := compressorPool.Get().(*flate.Writer)
 	w.Reset(&buf)
@@ -45,9 +65,6 @@ func CompressBlock(data []byte) ([]byte, error) {
 
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
 const MaxDecompressedSize = 16 << 20
-
-// sparse encoding constants - must match agent/replication/sparse.go
-const sparseMarker = uint32(0x53505253) // "SPRS"
 
 // DecompressBlock decompresses a block that was encoded with either flate
 // compression or sparse encoding.
@@ -71,46 +88,6 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	}
 
 	return buf, nil
-}
-
-// isSparseEncoded checks if a payload is sparse-encoded by checking the marker
-func isSparseEncoded(data []byte) bool {
-	if len(data) < 4 {
-		return false
-	}
-	return binary.BigEndian.Uint32(data[0:4]) == sparseMarker
-}
-
-// decodeSparse decodes a sparse-encoded payload back into a full block.
-// the caller provides the expected uncompressed length.
-func decodeSparse(encoded []byte, uncompressedLen int) ([]byte, error) {
-	block := make([]byte, uncompressedLen) // zero-filled
-
-	if len(encoded) < 6 {
-		return block, nil
-	}
-
-	regionCount := binary.BigEndian.Uint16(encoded[4:6])
-	pos := 6
-
-	for i := uint16(0); i < regionCount; i++ {
-		if pos+8 > len(encoded) {
-			break
-		}
-		offset := binary.BigEndian.Uint32(encoded[pos : pos+4])
-		length := binary.BigEndian.Uint32(encoded[pos+4 : pos+8])
-		pos += 8
-
-		if pos+int(length) > len(encoded) {
-			break
-		}
-		if int(offset)+int(length) <= uncompressedLen {
-			copy(block[offset:offset+length], encoded[pos:pos+int(length)])
-		}
-		pos += int(length)
-	}
-
-	return block, nil
 }
 
 // IsZeroBlock checks if all bytes in the block are zero
