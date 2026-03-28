@@ -1,0 +1,24 @@
+name: Check Go Version
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  check-go-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify go.mod specifies go 1.20
+        run: |
+          version=$(awk '/^go / { print $2 }' go.mod)
+          if [ "$version" != "1.20" ]; then
+            echo "::error::go.mod has 'go $version' but replproto must stay at go 1.20 (agent compatibility)"
+            exit 1
+          fi
