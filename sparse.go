@@ -12,8 +12,8 @@ import (
 // encoding is more efficient than flate compression because it can skip zero
 // runs entirely rather than compressing them.
 //
-// sparse payload format (used within MsgBlockData compressed data area):
-//   [SparseMarker(4)] [RegionCount(2)] [Region...]
+// sparse payload format (after the encodingSparse tag byte):
+//   [RegionCount(2)] [Region...]
 //
 // region format:
 //   [Offset(4)] [Length(4)] [Data(Length)]
@@ -22,11 +22,6 @@ import (
 // first, then overwrites the non-zero regions at their offsets.
 
 const (
-	// sparseMarker is prepended to sparse-encoded payloads to distinguish
-	// them from flate-compressed data. chosen to not collide with valid
-	// flate headers (0x78xx, 0x08xx).
-	sparseMarker = uint32(0x53505253) // "SPRS"
-
 	// sparseMinZeroRun is the minimum length of a zero run to be worth
 	// encoding as a gap. shorter runs are merged with adjacent data.
 	sparseMinZeroRun = 512
@@ -46,6 +41,7 @@ type sparseRegion struct {
 // trySparseEncode analyzes a block for zero regions and returns a sparse
 // encoding if beneficial. returns nil if the block doesn't benefit from
 // sparse encoding (use regular compression instead).
+// the returned slice is prefixed with the encodingSparse tag byte.
 func trySparseEncode(data []byte) []byte {
 	if len(data) == 0 {
 		return nil
@@ -70,8 +66,8 @@ func trySparseEncode(data []byte) []byte {
 		return nil // all zeros - let IsZeroBlock handle this
 	}
 
-	// calculate encoded size
-	encodedSize := 4 + 2 // marker + region count
+	// calculate encoded size: tag(1) + region_count(2) + regions
+	encodedSize := 1 + 2
 	dataBytes := 0
 	for _, r := range regions {
 		encodedSize += 4 + 4 + int(r.length) // offset + length + data
@@ -86,10 +82,10 @@ func trySparseEncode(data []byte) []byte {
 
 	// encode
 	buf := make([]byte, encodedSize)
-	binary.BigEndian.PutUint32(buf[0:4], sparseMarker)
-	binary.BigEndian.PutUint16(buf[4:6], uint16(len(regions)))
+	buf[0] = encodingSparse
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(regions)))
 
-	offset := 6
+	offset := 3
 	for _, r := range regions {
 		binary.BigEndian.PutUint32(buf[offset:offset+4], r.offset)
 		binary.BigEndian.PutUint32(buf[offset+4:offset+8], r.length)
@@ -100,25 +96,17 @@ func trySparseEncode(data []byte) []byte {
 	return buf
 }
 
-// isSparseEncoded checks if a payload is sparse-encoded by checking the marker
-func isSparseEncoded(data []byte) bool {
-	if len(data) < 4 {
-		return false
-	}
-	return binary.BigEndian.Uint32(data[0:4]) == sparseMarker
-}
-
 // decodeSparse decodes a sparse-encoded payload back into a full block.
-// the caller provides the expected uncompressed length.
+// the tag byte has already been stripped by the caller.
 func decodeSparse(encoded []byte, uncompressedLen int) ([]byte, error) {
 	block := make([]byte, uncompressedLen) // zero-filled
 
-	if len(encoded) < 6 {
+	if len(encoded) < 2 {
 		return block, nil
 	}
 
-	regionCount := binary.BigEndian.Uint16(encoded[4:6])
-	pos := 6
+	regionCount := binary.BigEndian.Uint16(encoded[0:2])
+	pos := 2
 
 	for i := uint16(0); i < regionCount; i++ {
 		if pos+8 > len(encoded) {

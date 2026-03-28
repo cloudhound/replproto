@@ -8,6 +8,12 @@ import (
 	"sync"
 )
 
+// encoding tag prefixes - first byte of every compressed payload
+const (
+	encodingFlate  byte = 0x01
+	encodingSparse byte = 0x02
+)
+
 // compressorPool reuses flate writers to avoid allocating a new compressor
 // for every 1 MiB block across 32 workers.
 var compressorPool = sync.Pool{
@@ -21,6 +27,8 @@ var compressorPool = sync.Pool{
 // returns nil if the block is all zeros (zero-block optimization).
 // for blocks with large zero regions (sparse), uses sparse encoding which
 // skips zero runs entirely. otherwise uses flate level 1 compression.
+// the first byte of the returned slice is an encoding tag so the decoder
+// knows which format was used without magic-byte sniffing.
 func CompressBlock(data []byte) ([]byte, error) {
 	if IsZeroBlock(data) {
 		return nil, nil // zero block - no data to send
@@ -43,9 +51,12 @@ func CompressBlock(data []byte) ([]byte, error) {
 	return flateCompress(data)
 }
 
-// flateCompress compresses data using flate level 1 (fastest)
+// flateCompress compresses data using flate level 1 (fastest).
+// the output is prefixed with encodingFlate tag byte.
 func flateCompress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
+	buf.WriteByte(encodingFlate)
+
 	w := compressorPool.Get().(*flate.Writer)
 	w.Reset(&buf)
 
@@ -66,28 +77,35 @@ func flateCompress(data []byte) ([]byte, error) {
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
 const MaxDecompressedSize = 16 << 20
 
-// DecompressBlock decompresses a block that was encoded with either flate
-// compression or sparse encoding.
+// DecompressBlock decompresses a block by reading the encoding tag prefix
+// and dispatching to the appropriate decoder.
 func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	if uncompressedLen <= 0 || uncompressedLen > MaxDecompressedSize {
 		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
 	}
 
-	// check for sparse encoding
-	if isSparseEncoded(compressed) {
-		return decodeSparse(compressed, uncompressedLen)
+	if len(compressed) < 1 {
+		return nil, fmt.Errorf("empty compressed data")
 	}
 
-	// standard flate decompression
-	r := flate.NewReader(bytes.NewReader(compressed))
-	defer r.Close()
+	switch compressed[0] {
+	case encodingSparse:
+		return decodeSparse(compressed[1:], uncompressedLen)
 
-	buf := make([]byte, uncompressedLen)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, fmt.Errorf("decompress: %w", err)
+	case encodingFlate:
+		r := flate.NewReader(bytes.NewReader(compressed[1:]))
+		defer r.Close()
+
+		buf := make([]byte, uncompressedLen)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("decompress: %w", err)
+		}
+
+		return buf, nil
+
+	default:
+		return nil, fmt.Errorf("unknown encoding tag: 0x%02X", compressed[0])
 	}
-
-	return buf, nil
 }
 
 // IsZeroBlock checks if all bytes in the block are zero
