@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"unsafe"
 )
 
@@ -284,18 +285,27 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			continue
 		}
 
-		// slow path: mixed byte — process 8 bits
-		for bitIdx := uint(7); ; bitIdx-- {
-			bit := (b >> bitIdx) & 1
-			if bit == currentBit {
-				count++
-			} else {
-				dst = appendRun(dst, count, currentBit)
-				currentBit = bit
-				count = 1
+		// slow path: mixed byte — use CLZ to find runs in O(transitions) instead of O(8)
+		bitsLeft := uint(8)
+		for bitsLeft > 0 {
+			// Build a mask where matching bits are 0 and differing bits are 1,
+			// shifted so the remaining bits occupy the MSB of the byte.
+			var mask uint8
+			if currentBit == 1 {
+				mask = 0xFF
 			}
-			if bitIdx == 0 {
-				break
+			diff := (b << (8 - bitsLeft)) ^ mask
+			run := uint(bits.LeadingZeros8(diff))
+			if run > bitsLeft {
+				run = bitsLeft
+			}
+			count += uint32(run)
+			bitsLeft -= run
+			if bitsLeft > 0 {
+				// transition: emit current run and flip
+				dst = appendRun(dst, count, currentBit)
+				currentBit ^= 1
+				count = 0
 			}
 		}
 	}
@@ -378,13 +388,22 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			pos++
 		}
 
-		// bulk fill aligned whole bytes with memset pattern
+		// bulk fill aligned whole bytes
+		// Split into constant-value branches so the compiler emits
+		// memclr (for 0x00) or a vectorized memset (for 0xFF)
+		// instead of a byte-at-a-time store loop.
 		if pos+8 <= end {
 			startByte := pos >> 3
 			fillBytes := (end - pos) >> 3
 			region := bitmap[startByte : startByte+fillBytes]
-			for i := range region {
-				region[i] = fillByte
+			if fillByte == 0xFF {
+				for i := range region {
+					region[i] = 0xFF
+				}
+			} else {
+				for i := range region {
+					region[i] = 0
+				}
 			}
 			pos += fillBytes * 8
 		}

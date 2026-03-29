@@ -116,6 +116,20 @@ func BenchmarkEncodeBitmapRLE_Dense(b *testing.B) {
 	}
 }
 
+func BenchmarkEncodeBitmapRLE_Mixed(b *testing.B) {
+	// 1 MiB bitmap with random data — exercises the CLZ slow path
+	totalBlocks := uint64(8 * 1024 * 1024)
+	bitmap := make([]byte, totalBlocks/8)
+	rand.Read(bitmap)
+	var dst []byte
+
+	b.SetBytes(int64(len(bitmap)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst = AppendBitmapRLE(dst, bitmap, totalBlocks)
+	}
+}
+
 func BenchmarkDecodeBitmapRLE(b *testing.B) {
 	totalBlocks := uint64(8 * 1024 * 1024)
 	bitmap := make([]byte, totalBlocks/8)
