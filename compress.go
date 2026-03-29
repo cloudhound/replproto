@@ -1,68 +1,53 @@
 package replproto
 
 import (
-	"bytes"
-	"compress/flate"
 	"fmt"
-	"io"
+	"unsafe"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/klauspost/compress/s2"
 )
 
 // encoding tag prefixes - first byte of every compressed payload
 const (
-	EncodingFlate  byte = 0x01
-	EncodingSparse byte = 0x02
-	EncodingLZ4    byte = 0x03
+	EncodingS2  byte = 0x05
+	EncodingRaw byte = 0x04
 )
 
-// CompressBlock compresses a block using LZ4.
+// CompressBlock compresses a block using S2.
 // returns nil if the block is all zeros (zero-block optimization).
-// for blocks with large zero regions (sparse), uses sparse encoding which
-// skips zero runs entirely. falls back to flate if LZ4 can't compress.
-// the first byte of the returned slice is an encoding tag so the decoder
-// knows which format was used.
+// S2 handles zero runs efficiently so no separate sparse pass is needed.
+// falls back to raw storage if S2 expands the data.
+//
+// designed for minimal CPU impact: one zero-check pass (uint64),
+// then a single S2 pass. no intermediate copies.
 func CompressBlock(data []byte) ([]byte, error) {
 	if IsZeroBlock(data) {
 		return nil, nil
 	}
 
-	// try sparse encoding first - beneficial for VM disks, database files,
-	// and NTFS sparse files where allocated blocks contain large zero regions
-	if sparse := trySparseEncode(data); sparse != nil {
-		return sparse, nil
+	// single allocation: tag byte + max compressed output.
+	// S2 writes directly into this buffer — no pool, no copy.
+	maxLen := s2.MaxEncodedLen(len(data))
+	if maxLen <= 0 {
+		out := make([]byte, 1+len(data))
+		out[0] = EncodingRaw
+		copy(out[1:], data)
+		return out, nil
 	}
 
-	// lz4 block compression
-	maxLen := lz4.CompressBlockBound(len(data))
 	buf := make([]byte, 1+maxLen)
-	buf[0] = EncodingLZ4
-	n, err := lz4.CompressBlock(data, buf[1:], nil)
-	if err == nil && n > 0 {
-		return buf[:1+n], nil
+	buf[0] = EncodingS2
+	compressed := s2.Encode(buf[1:], data)
+
+	if len(compressed) >= len(data) {
+		// S2 expanded the data (encrypted/already-compressed) — store raw
+		out := make([]byte, 1+len(data))
+		out[0] = EncodingRaw
+		copy(out[1:], data)
+		return out, nil
 	}
 
-	// lz4 couldn't compress (incompressible data), fall back to flate
-	return flateCompress(data)
-}
-
-// flateCompress compresses data using flate level 1 (fastest).
-// the output is prefixed with EncodingFlate tag byte.
-func flateCompress(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteByte(EncodingFlate)
-
-	w, _ := flate.NewWriter(&buf, flate.BestSpeed)
-
-	if _, err := w.Write(data); err != nil {
-		return nil, fmt.Errorf("compress: %w", err)
-	}
-
-	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("close compressor: %w", err)
-	}
-
-	return buf.Bytes(), nil
+	return buf[:1+len(compressed)], nil
 }
 
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
@@ -80,26 +65,12 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	}
 
 	switch compressed[0] {
-	case EncodingSparse:
-		return decodeSparse(compressed[1:], uncompressedLen)
+	case EncodingS2:
+		return s2.Decode(nil, compressed[1:])
 
-	case EncodingLZ4:
+	case EncodingRaw:
 		buf := make([]byte, uncompressedLen)
-		n, err := lz4.UncompressBlock(compressed[1:], buf)
-		if err != nil {
-			return nil, fmt.Errorf("lz4 decompress: %w", err)
-		}
-		return buf[:n], nil
-
-	case EncodingFlate:
-		r := flate.NewReader(bytes.NewReader(compressed[1:]))
-		defer r.Close()
-
-		buf := make([]byte, uncompressedLen)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-
+		copy(buf, compressed[1:])
 		return buf, nil
 
 	default:
@@ -107,27 +78,21 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	}
 }
 
-// IsZeroBlock checks if all bytes in the block are zero
+// IsZeroBlock checks if all bytes in the block are zero.
+// Uses uint64 comparisons for speed (~8x faster than byte-at-a-time).
 func IsZeroBlock(data []byte) bool {
-	// check in 8-byte chunks for speed
 	n := len(data)
 	i := 0
-
-	// check 8 bytes at a time
 	for i+8 <= n {
-		if data[i] != 0 || data[i+1] != 0 || data[i+2] != 0 || data[i+3] != 0 ||
-			data[i+4] != 0 || data[i+5] != 0 || data[i+6] != 0 || data[i+7] != 0 {
+		if *(*uint64)(unsafe.Pointer(&data[i])) != 0 {
 			return false
 		}
 		i += 8
 	}
-
-	// check remaining bytes
 	for ; i < n; i++ {
 		if data[i] != 0 {
 			return false
 		}
 	}
-
 	return true
 }
