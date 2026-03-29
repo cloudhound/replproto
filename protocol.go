@@ -124,11 +124,11 @@ func (d *FrameDecoder) DecodeFrame(r io.Reader) (Frame, error) {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
-	// verify crc32-c incrementally over header + payload
-	h := crc32.New(castagnoliTable)
-	h.Write(d.header[:])
-	h.Write(d.buf[:payloadLen])
-	expected := h.Sum32()
+	// verify crc32-c over header + payload — no allocation
+	expected := crc32.Update(
+		crc32.Update(0, castagnoliTable, d.header[:]),
+		castagnoliTable, d.buf[:payloadLen],
+	)
 	got := binary.BigEndian.Uint32(d.buf[payloadLen:])
 	if got != expected {
 		return Frame{}, fmt.Errorf("crc mismatch: expected 0x%08X, got 0x%08X", expected, got)
@@ -187,29 +187,88 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 		return nil
 	}
 
-	// pre-allocate with a reasonable estimate to avoid per-run allocations
-	result := make([]byte, 0, 256*5)
+	// estimate: assume ~1 transition per 64 bits on average
+	estRuns := totalBlocks/64 + 2
+	if estRuns < 16 {
+		estRuns = 16
+	}
+	result := make([]byte, 0, estRuns*5)
 	var run [5]byte
+
 	currentBit := (bitmap[0] >> 7) & 1
 	count := uint32(0)
 
-	for i := uint64(0); i < totalBlocks; i++ {
-		byteIdx := i / 8
-		bitIdx := 7 - (i % 8)
-		var bit byte
+	// number of full bytes covered by totalBlocks
+	fullBytes := totalBlocks / 8
+	tailBits := totalBlocks & 7
+
+	for byteIdx := uint64(0); byteIdx < fullBytes; byteIdx++ {
+		var b byte
 		if byteIdx < uint64(len(bitmap)) {
-			bit = (bitmap[byteIdx] >> bitIdx) & 1
+			b = bitmap[byteIdx]
 		}
 
-		if bit == currentBit {
-			count++
-		} else {
-			// flush run
-			binary.BigEndian.PutUint32(run[0:4], count)
-			run[4] = currentBit
-			result = append(result, run[:]...)
-			currentBit = bit
-			count = 1
+		// fast path: entire byte is all-0 or all-1
+		if b == 0x00 {
+			if currentBit == 0 {
+				count += 8
+			} else {
+				binary.BigEndian.PutUint32(run[0:4], count)
+				run[4] = currentBit
+				result = append(result, run[:]...)
+				currentBit = 0
+				count = 8
+			}
+			continue
+		}
+		if b == 0xFF {
+			if currentBit == 1 {
+				count += 8
+			} else {
+				binary.BigEndian.PutUint32(run[0:4], count)
+				run[4] = currentBit
+				result = append(result, run[:]...)
+				currentBit = 1
+				count = 8
+			}
+			continue
+		}
+
+		// slow path: mixed byte — process 8 bits
+		for bitIdx := uint(7); ; bitIdx-- {
+			bit := (b >> bitIdx) & 1
+			if bit == currentBit {
+				count++
+			} else {
+				binary.BigEndian.PutUint32(run[0:4], count)
+				run[4] = currentBit
+				result = append(result, run[:]...)
+				currentBit = bit
+				count = 1
+			}
+			if bitIdx == 0 {
+				break
+			}
+		}
+	}
+
+	// handle remaining tail bits
+	if tailBits > 0 {
+		var b byte
+		if fullBytes < uint64(len(bitmap)) {
+			b = bitmap[fullBytes]
+		}
+		for bitIdx := uint(7); bitIdx > 7-uint(tailBits); bitIdx-- {
+			bit := (b >> bitIdx) & 1
+			if bit == currentBit {
+				count++
+			} else {
+				binary.BigEndian.PutUint32(run[0:4], count)
+				run[4] = currentBit
+				result = append(result, run[:]...)
+				currentBit = bit
+				count = 1
+			}
 		}
 	}
 
@@ -232,16 +291,37 @@ func DecodeBitmapRLE(data []byte, totalBlocks uint64) ([]byte, error) {
 	offset := 0
 
 	for offset+5 <= len(data) {
-		count := binary.BigEndian.Uint32(data[offset : offset+4])
+		count := uint64(binary.BigEndian.Uint32(data[offset : offset+4]))
 		value := data[offset+4]
 		offset += 5
 
-		for i := uint32(0); i < count && pos < totalBlocks; i++ {
-			if value == 1 {
-				byteIdx := pos / 8
-				bitIdx := 7 - (pos % 8)
-				bitmap[byteIdx] |= 1 << bitIdx
+		end := pos + count
+		if end > totalBlocks {
+			end = totalBlocks
+		}
+
+		if value == 0 {
+			// bitmap is already zeroed — just advance
+			pos = end
+			continue
+		}
+
+		// value == 1: set bits from pos to end
+		for pos < end {
+			byteIdx := pos >> 3
+			bitOff := 7 - (pos & 7)
+
+			if bitOff == 7 && pos+8 <= end {
+				// aligned and at least 8 bits: fill whole bytes
+				fillEnd := (end - pos) >> 3 // number of full bytes
+				for j := uint64(0); j < fillEnd; j++ {
+					bitmap[byteIdx+j] = 0xFF
+				}
+				pos += fillEnd * 8
+				continue
 			}
+
+			bitmap[byteIdx] |= 1 << bitOff
 			pos++
 		}
 	}
