@@ -2,7 +2,6 @@ package replproto
 
 import (
 	"fmt"
-	"unsafe"
 
 	"github.com/klauspost/compress/s2"
 )
@@ -88,32 +87,3 @@ func grow(buf []byte, n int) []byte {
 	return make([]byte, n)
 }
 
-// IsZeroBlock checks if all bytes in the block are zero.
-// Uses unrolled uint64 comparisons for speed.
-func IsZeroBlock(data []byte) bool {
-	n := len(data)
-	i := 0
-	// process 32 bytes per iteration (4 × uint64)
-	for i+32 <= n {
-		w0 := *(*uint64)(unsafe.Pointer(&data[i]))
-		w1 := *(*uint64)(unsafe.Pointer(&data[i+8]))
-		w2 := *(*uint64)(unsafe.Pointer(&data[i+16]))
-		w3 := *(*uint64)(unsafe.Pointer(&data[i+24]))
-		if (w0 | w1 | w2 | w3) != 0 {
-			return false
-		}
-		i += 32
-	}
-	for i+8 <= n {
-		if *(*uint64)(unsafe.Pointer(&data[i])) != 0 {
-			return false
-		}
-		i += 8
-	}
-	for ; i < n; i++ {
-		if data[i] != 0 {
-			return false
-		}
-	}
-	return true
-}
