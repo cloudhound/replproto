@@ -3,6 +3,7 @@ package replproto
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"testing"
 )
 
@@ -128,6 +129,92 @@ func BenchmarkDecodeBitmapRLE(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		dst, _ = DecodeBitmapRLETo(dst, encoded, totalBlocks)
+	}
+}
+
+// BenchmarkEndToEnd measures the full replication pipeline:
+// compress → encode block data payload → encode frame → decode frame → decompress
+func BenchmarkEndToEnd(b *testing.B) {
+	for _, size := range []int{4096, 64 * 1024, 256 * 1024, 1024 * 1024} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			src := make([]byte, size)
+			rand.Read(src)
+
+			hdr := BlockDataHeader{
+				DeviceID:        1,
+				BlockOffset:     0,
+				UncompressedLen: uint32(size),
+			}
+
+			enc := &FrameEncoder{}
+			dec := &FrameDecoder{}
+			var compBuf, payloadBuf, decompBuf []byte
+			var buf bytes.Buffer
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// --- sender side ---
+				var err error
+				compBuf, err = CompressBlock(compBuf, src)
+				if err != nil {
+					b.Fatal(err)
+				}
+				payloadBuf = EncodeBlockDataPayload(payloadBuf, hdr, compBuf)
+
+				buf.Reset()
+				if err := enc.EncodeFrame(&buf, Frame{Type: MsgBlockData, Payload: payloadBuf}); err != nil {
+					b.Fatal(err)
+				}
+
+				// --- receiver side ---
+				f, err := dec.DecodeFrame(&buf)
+				if err != nil {
+					b.Fatal(err)
+				}
+				_, compressed, err := DecodeBlockDataPayload(f.Payload)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decompBuf, err = DecompressBlock(decompBuf, compressed, size)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkEndToEndZero measures end-to-end with zero blocks (skip-compressed).
+func BenchmarkEndToEndZero(b *testing.B) {
+	size := 4096
+	src := make([]byte, size)
+
+	hdr := BlockDataHeader{
+		DeviceID:        1,
+		BlockOffset:     0,
+		UncompressedLen: uint32(size),
+	}
+
+	enc := &FrameEncoder{}
+	dec := &FrameDecoder{}
+	var compBuf, payloadBuf, decompBuf []byte
+	var buf bytes.Buffer
+
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		compBuf, _ = CompressBlock(compBuf, src)
+		if len(compBuf) == 0 {
+			// zero block — sender would skip, but measure the detect cost
+			continue
+		}
+		payloadBuf = EncodeBlockDataPayload(payloadBuf, hdr, compBuf)
+		buf.Reset()
+		enc.EncodeFrame(&buf, Frame{Type: MsgBlockData, Payload: payloadBuf})
+		f, _ := dec.DecodeFrame(&buf)
+		_, compressed, _ := DecodeBlockDataPayload(f.Payload)
+		decompBuf, _ = DecompressBlock(decompBuf, compressed, size)
 	}
 }
 
