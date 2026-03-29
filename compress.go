@@ -40,12 +40,11 @@ func CompressBlock(dst, src []byte) ([]byte, error) {
 	compressed := s2.Encode(dst[1:], src)
 
 	if len(compressed) >= len(src) {
-		// S2 expanded the data — store raw
-		needed = 1 + len(src)
-		dst = grow(dst, needed)
+		// S2 expanded the data — store raw.
+		// dst already has cap >= 1+maxLen >= 1+len(src), so no regrow needed.
 		dst[0] = EncodingRaw
 		copy(dst[1:], src)
-		return dst[:needed], nil
+		return dst[:1+len(src)], nil
 	}
 
 	return dst[:1+len(compressed)], nil
