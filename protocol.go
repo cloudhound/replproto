@@ -5,22 +5,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"sync"
 )
 
 // castagnoliTable is a pre-computed CRC32-C (Castagnoli) table.
 // CRC32-C has hardware acceleration via SSE4.2 (x86) and ARMv8,
 // giving 10-20x speedup over the software-only IEEE polynomial.
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
-
-// framePool reuses frame buffers to reduce allocations in the hot path.
-var framePool = sync.Pool{
-	New: func() any {
-		// start with a reasonable default; grows as needed
-		buf := make([]byte, 0, 4096)
-		return &buf
-	},
-}
 
 // wire protocol constants
 const (
@@ -54,8 +44,16 @@ type Frame struct {
 	Payload []byte
 }
 
-// EncodeFrame writes a frame to the given writer
-func EncodeFrame(w io.Writer, f Frame) error {
+// FrameEncoder holds a reusable buffer for encoding frames.
+// Allocate one per goroutine for zero-GC frame encoding.
+type FrameEncoder struct {
+	buf []byte
+}
+
+// EncodeFrame writes a frame to the given writer.
+// The internal buffer is reused across calls — zero allocations
+// after the first call with the largest frame size.
+func (e *FrameEncoder) EncodeFrame(w io.Writer, f Frame) error {
 	payloadLen := len(f.Payload)
 	if payloadLen > MaxPayloadSize {
 		return fmt.Errorf("payload too large: %d > %d", payloadLen, MaxPayloadSize)
@@ -64,75 +62,80 @@ func EncodeFrame(w io.Writer, f Frame) error {
 	// build the frame: magic + type + length + payload + crc
 	frameSize := FrameHeaderSize + payloadLen + FrameCRCSize
 
-	bufp := framePool.Get().(*[]byte)
-	buf := *bufp
-	if cap(buf) < frameSize {
-		buf = make([]byte, frameSize)
+	if cap(e.buf) < frameSize {
+		e.buf = make([]byte, frameSize)
 	} else {
-		buf = buf[:frameSize]
+		e.buf = e.buf[:frameSize]
 	}
 
 	// magic
-	binary.BigEndian.PutUint32(buf[0:4], FrameMagic)
+	binary.BigEndian.PutUint32(e.buf[0:4], FrameMagic)
 	// type
-	buf[4] = f.Type
+	e.buf[4] = f.Type
 	// payload length
-	binary.BigEndian.PutUint32(buf[5:9], uint32(payloadLen))
+	binary.BigEndian.PutUint32(e.buf[5:9], uint32(payloadLen))
 	// payload
-	copy(buf[9:9+payloadLen], f.Payload)
+	copy(e.buf[9:9+payloadLen], f.Payload)
 	// crc32-c of everything before the crc
-	crc := crc32.Checksum(buf[:9+payloadLen], castagnoliTable)
-	binary.BigEndian.PutUint32(buf[9+payloadLen:], crc)
+	crc := crc32.Checksum(e.buf[:9+payloadLen], castagnoliTable)
+	binary.BigEndian.PutUint32(e.buf[9+payloadLen:], crc)
 
-	_, err := w.Write(buf)
-
-	*bufp = buf
-	framePool.Put(bufp)
-
+	_, err := w.Write(e.buf)
 	return err
 }
 
-// DecodeFrame reads a single frame from the reader
-func DecodeFrame(r io.Reader) (Frame, error) {
-	// read header
-	header := make([]byte, FrameHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
+// FrameDecoder holds reusable buffers for decoding frames.
+// Allocate one per goroutine for zero-GC frame decoding.
+type FrameDecoder struct {
+	header [FrameHeaderSize]byte
+	buf    []byte
+}
+
+// DecodeFrame reads a single frame from the reader into caller-owned buffers.
+// The returned Frame.Payload is valid until the next call to DecodeFrame.
+func (d *FrameDecoder) DecodeFrame(r io.Reader) (Frame, error) {
+	// read header into fixed-size array (no allocation)
+	if _, err := io.ReadFull(r, d.header[:]); err != nil {
 		return Frame{}, fmt.Errorf("read header: %w", err)
 	}
 
 	// validate magic
-	magic := binary.BigEndian.Uint32(header[0:4])
+	magic := binary.BigEndian.Uint32(d.header[0:4])
 	if magic != FrameMagic {
 		return Frame{}, fmt.Errorf("invalid magic: 0x%08X", magic)
 	}
 
-	msgType := header[4]
-	payloadLen := binary.BigEndian.Uint32(header[5:9])
+	msgType := d.header[4]
+	payloadLen := binary.BigEndian.Uint32(d.header[5:9])
 
 	if payloadLen > MaxPayloadSize {
 		return Frame{}, fmt.Errorf("payload too large: %d", payloadLen)
 	}
 
-	// read payload + crc
-	rest := make([]byte, payloadLen+FrameCRCSize)
-	if _, err := io.ReadFull(r, rest); err != nil {
+	// reuse buffer for payload + crc
+	needed := int(payloadLen) + FrameCRCSize
+	if cap(d.buf) < needed {
+		d.buf = make([]byte, needed)
+	} else {
+		d.buf = d.buf[:needed]
+	}
+
+	if _, err := io.ReadFull(r, d.buf); err != nil {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
 	// verify crc32-c incrementally over header + payload
 	h := crc32.New(castagnoliTable)
-	h.Write(header)
-	h.Write(rest[:payloadLen])
+	h.Write(d.header[:])
+	h.Write(d.buf[:payloadLen])
 	expected := h.Sum32()
-	got := binary.BigEndian.Uint32(rest[payloadLen:])
+	got := binary.BigEndian.Uint32(d.buf[payloadLen:])
 	if got != expected {
 		return Frame{}, fmt.Errorf("crc mismatch: expected 0x%08X, got 0x%08X", expected, got)
 	}
 
-	payload := make([]byte, payloadLen)
-	copy(payload, rest[:payloadLen])
-
-	return Frame{Type: msgType, Payload: payload}, nil
+	// return payload as a slice of the reusable buffer — no copy
+	return Frame{Type: msgType, Payload: d.buf[:payloadLen]}, nil
 }
 
 // block data binary payload helpers
