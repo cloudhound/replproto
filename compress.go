@@ -1,10 +1,7 @@
 package replproto
 
 import (
-	"bytes"
-	"compress/flate"
 	"fmt"
-	"io"
 	"sync"
 	"unsafe"
 
@@ -13,7 +10,6 @@ import (
 
 // encoding tag prefixes - first byte of every compressed payload
 const (
-	EncodingFlate  byte = 0x01
 	EncodingSparse byte = 0x02
 	EncodingLZ4    byte = 0x03
 	EncodingRaw    byte = 0x04
@@ -27,19 +23,10 @@ var lz4BufPool = sync.Pool{
 	},
 }
 
-// flateWriterPool reuses flate.Writer to avoid rebuilding Huffman state.
-var flateWriterPool = sync.Pool{
-	New: func() any {
-		w, _ := flate.NewWriter(nil, flate.BestSpeed)
-		return w
-	},
-}
-
 // CompressBlock compresses a block using LZ4.
 // returns nil if the block is all zeros (zero-block optimization).
 // for blocks with large zero regions (sparse), uses sparse encoding which
-// skips zero runs entirely. falls back to raw storage if LZ4 can't compress,
-// since incompressible data won't benefit from flate either.
+// skips zero runs entirely. falls back to raw storage if LZ4 can't compress.
 // the first byte of the returned slice is an encoding tag so the decoder
 // knows which format was used.
 func CompressBlock(data []byte) ([]byte, error) {
@@ -77,35 +64,11 @@ func CompressBlock(data []byte) ([]byte, error) {
 	*bufp = buf
 	lz4BufPool.Put(bufp)
 
-	// LZ4 couldn't compress — store raw. Incompressible data won't benefit
-	// from flate either, and flate burns significant CPU rebuilding state.
+	// LZ4 couldn't compress — store raw
 	out := make([]byte, 1+len(data))
 	out[0] = EncodingRaw
 	copy(out[1:], data)
 	return out, nil
-}
-
-// flateCompress compresses data using flate level 1 (fastest).
-// the output is prefixed with EncodingFlate tag byte.
-func flateCompress(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteByte(EncodingFlate)
-
-	w := flateWriterPool.Get().(*flate.Writer)
-	w.Reset(&buf)
-
-	if _, err := w.Write(data); err != nil {
-		flateWriterPool.Put(w)
-		return nil, fmt.Errorf("compress: %w", err)
-	}
-
-	if err := w.Close(); err != nil {
-		flateWriterPool.Put(w)
-		return nil, fmt.Errorf("close compressor: %w", err)
-	}
-
-	flateWriterPool.Put(w)
-	return buf.Bytes(), nil
 }
 
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
@@ -133,17 +96,6 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 			return nil, fmt.Errorf("lz4 decompress: %w", err)
 		}
 		return buf[:n], nil
-
-	case EncodingFlate:
-		r := flate.NewReader(bytes.NewReader(compressed[1:]))
-		defer r.Close()
-
-		buf := make([]byte, uncompressedLen)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-
-		return buf, nil
 
 	case EncodingRaw:
 		buf := make([]byte, uncompressedLen)
