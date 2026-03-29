@@ -13,69 +13,80 @@ const (
 	EncodingRaw byte = 0x04
 )
 
-// CompressBlock compresses a block using S2.
-// returns nil if the block is all zeros (zero-block optimization).
-// S2 handles zero runs efficiently so no separate sparse pass is needed.
-// falls back to raw storage if S2 expands the data.
+// CompressBlock compresses src into dst using S2.
+// dst is reused if large enough, grown if not. The returned slice may
+// alias dst's underlying array — the caller should keep one dst buffer
+// and pass it to every call for zero-GC operation.
 //
-// designed for minimal CPU impact: one zero-check pass (uint64),
-// then a single S2 pass. no intermediate copies.
-func CompressBlock(data []byte) ([]byte, error) {
-	if IsZeroBlock(data) {
-		return nil, nil
+// returns (nil, nil) if the block is all zeros.
+func CompressBlock(dst, src []byte) ([]byte, error) {
+	if IsZeroBlock(src) {
+		return dst[:0], nil
 	}
 
-	// single allocation: tag byte + max compressed output.
-	// S2 writes directly into this buffer — no pool, no copy.
-	maxLen := s2.MaxEncodedLen(len(data))
+	maxLen := s2.MaxEncodedLen(len(src))
 	if maxLen <= 0 {
-		out := make([]byte, 1+len(data))
-		out[0] = EncodingRaw
-		copy(out[1:], data)
-		return out, nil
+		// too large for S2 — store raw
+		needed := 1 + len(src)
+		dst = grow(dst, needed)
+		dst[0] = EncodingRaw
+		copy(dst[1:], src)
+		return dst[:needed], nil
 	}
 
-	buf := make([]byte, 1+maxLen)
-	buf[0] = EncodingS2
-	compressed := s2.Encode(buf[1:], data)
+	needed := 1 + maxLen
+	dst = grow(dst, needed)
+	dst[0] = EncodingS2
+	compressed := s2.Encode(dst[1:], src)
 
-	if len(compressed) >= len(data) {
-		// S2 expanded the data (encrypted/already-compressed) — store raw
-		out := make([]byte, 1+len(data))
-		out[0] = EncodingRaw
-		copy(out[1:], data)
-		return out, nil
+	if len(compressed) >= len(src) {
+		// S2 expanded the data — store raw
+		needed = 1 + len(src)
+		dst = grow(dst, needed)
+		dst[0] = EncodingRaw
+		copy(dst[1:], src)
+		return dst[:needed], nil
 	}
 
-	return buf[:1+len(compressed)], nil
+	return dst[:1+len(compressed)], nil
+}
+
+// DecompressBlock decompresses src into dst.
+// dst is reused if large enough. The returned slice may alias dst.
+func DecompressBlock(dst, src []byte, uncompressedLen int) ([]byte, error) {
+	if uncompressedLen <= 0 || uncompressedLen > MaxDecompressedSize {
+		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
+	}
+
+	if len(src) < 1 {
+		return nil, fmt.Errorf("empty compressed data")
+	}
+
+	switch src[0] {
+	case EncodingS2:
+		dst = grow(dst, uncompressedLen)
+		return s2.Decode(dst[:uncompressedLen], src[1:])
+
+	case EncodingRaw:
+		dst = grow(dst, uncompressedLen)
+		copy(dst, src[1:])
+		return dst[:uncompressedLen], nil
+
+	default:
+		return nil, fmt.Errorf("unknown encoding tag: 0x%02X", src[0])
+	}
 }
 
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
 const MaxDecompressedSize = 16 << 20
 
-// DecompressBlock decompresses a block by reading the encoding tag prefix
-// and dispatching to the appropriate decoder.
-func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
-	if uncompressedLen <= 0 || uncompressedLen > MaxDecompressedSize {
-		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
+// grow returns a slice with at least n bytes of capacity.
+// reuses the existing backing array if possible.
+func grow(buf []byte, n int) []byte {
+	if cap(buf) >= n {
+		return buf[:n]
 	}
-
-	if len(compressed) < 1 {
-		return nil, fmt.Errorf("empty compressed data")
-	}
-
-	switch compressed[0] {
-	case EncodingS2:
-		return s2.Decode(nil, compressed[1:])
-
-	case EncodingRaw:
-		buf := make([]byte, uncompressedLen)
-		copy(buf, compressed[1:])
-		return buf, nil
-
-	default:
-		return nil, fmt.Errorf("unknown encoding tag: 0x%02X", compressed[0])
-	}
+	return make([]byte, n)
 }
 
 // IsZeroBlock checks if all bytes in the block are zero.
