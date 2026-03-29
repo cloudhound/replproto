@@ -5,7 +5,22 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 )
+
+// castagnoliTable is a pre-computed CRC32-C (Castagnoli) table.
+// CRC32-C has hardware acceleration via SSE4.2 (x86) and ARMv8,
+// giving 10-20x speedup over the software-only IEEE polynomial.
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+// framePool reuses frame buffers to reduce allocations in the hot path.
+var framePool = sync.Pool{
+	New: func() any {
+		// start with a reasonable default; grows as needed
+		buf := make([]byte, 0, 4096)
+		return &buf
+	},
+}
 
 // wire protocol constants
 const (
@@ -46,9 +61,16 @@ func EncodeFrame(w io.Writer, f Frame) error {
 		return fmt.Errorf("payload too large: %d > %d", payloadLen, MaxPayloadSize)
 	}
 
-	// build the frame: magic + type + length + payload
+	// build the frame: magic + type + length + payload + crc
 	frameSize := FrameHeaderSize + payloadLen + FrameCRCSize
-	buf := make([]byte, frameSize)
+
+	bufp := framePool.Get().(*[]byte)
+	buf := *bufp
+	if cap(buf) < frameSize {
+		buf = make([]byte, frameSize)
+	} else {
+		buf = buf[:frameSize]
+	}
 
 	// magic
 	binary.BigEndian.PutUint32(buf[0:4], FrameMagic)
@@ -58,11 +80,15 @@ func EncodeFrame(w io.Writer, f Frame) error {
 	binary.BigEndian.PutUint32(buf[5:9], uint32(payloadLen))
 	// payload
 	copy(buf[9:9+payloadLen], f.Payload)
-	// crc32 of everything before the crc
-	crc := crc32.ChecksumIEEE(buf[:9+payloadLen])
+	// crc32-c of everything before the crc
+	crc := crc32.Checksum(buf[:9+payloadLen], castagnoliTable)
 	binary.BigEndian.PutUint32(buf[9+payloadLen:], crc)
 
 	_, err := w.Write(buf)
+
+	*bufp = buf
+	framePool.Put(bufp)
+
 	return err
 }
 
@@ -93,9 +119,8 @@ func DecodeFrame(r io.Reader) (Frame, error) {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
-	// verify crc - computed incrementally over header + payload
-	// to avoid allocating a copy of the entire frame
-	h := crc32.NewIEEE()
+	// verify crc32-c incrementally over header + payload
+	h := crc32.New(castagnoliTable)
 	h.Write(header)
 	h.Write(rest[:payloadLen])
 	expected := h.Sum32()
