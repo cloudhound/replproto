@@ -117,11 +117,11 @@ type BlockDataHeader struct {
 	DeviceID        uint16
 	BlockOffset     uint64
 	UncompressedLen uint32
-	Checksum        [32]byte
+	Checksum        [8]byte
 }
 
 // BlockDataHeaderSize is the byte size of a serialized BlockDataHeader
-const BlockDataHeaderSize = 2 + 8 + 4 + 32 // 46 bytes
+const BlockDataHeaderSize = 2 + 8 + 4 + 8 // 22 bytes
 
 // EncodeBlockDataPayload builds a BLOCK_DATA payload from header + compressed data
 func EncodeBlockDataPayload(h BlockDataHeader, compressedData []byte) []byte {
@@ -129,8 +129,8 @@ func EncodeBlockDataPayload(h BlockDataHeader, compressedData []byte) []byte {
 	binary.BigEndian.PutUint16(buf[0:2], h.DeviceID)
 	binary.BigEndian.PutUint64(buf[2:10], h.BlockOffset)
 	binary.BigEndian.PutUint32(buf[10:14], h.UncompressedLen)
-	copy(buf[14:46], h.Checksum[:])
-	copy(buf[46:], compressedData)
+	copy(buf[14:22], h.Checksum[:])
+	copy(buf[22:], compressedData)
 	return buf
 }
 
@@ -144,9 +144,9 @@ func DecodeBlockDataPayload(data []byte) (BlockDataHeader, []byte, error) {
 	h.DeviceID = binary.BigEndian.Uint16(data[0:2])
 	h.BlockOffset = binary.BigEndian.Uint64(data[2:10])
 	h.UncompressedLen = binary.BigEndian.Uint32(data[10:14])
-	copy(h.Checksum[:], data[14:46])
+	copy(h.Checksum[:], data[14:22])
 
-	compressed := data[46:]
+	compressed := data[22:]
 	return h, compressed, nil
 }
 

@@ -1,8 +1,6 @@
 package replproto
 
-import "crypto/sha256"
-
-// ComputeChecksum computes SHA-256 of a data block
-func ComputeChecksum(data []byte) [32]byte {
-	return sha256.Sum256(data)
-}
+// ChecksumSize is the size of a block checksum in bytes (XXH64 = 8 bytes).
+// consumers compute checksums using github.com/cespare/xxhash/v2 directly
+// to keep replproto free of external dependencies.
+const ChecksumSize = 8
