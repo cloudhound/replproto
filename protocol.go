@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"unsafe"
 )
 
 // castagnoliTable is a pre-computed CRC32-C (Castagnoli) table.
@@ -186,11 +187,18 @@ func DecodeBlockDataPayload(data []byte) (BlockDataHeader, []byte, error) {
 
 // rle bitmap encoding for BLOCK_BITMAP messages
 
-// EncodeBitmapRLE encodes a bitmap using run-length encoding
+// EncodeBitmapRLE encodes a bitmap using run-length encoding.
 // each run is: [4-byte count][1-byte value (0 or 1)]
+// dst is reused if large enough — pass the same slice across calls for zero-GC.
 func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
+	return AppendBitmapRLE(nil, bitmap, totalBlocks)
+}
+
+// AppendBitmapRLE is like EncodeBitmapRLE but reuses the dst buffer.
+// dst is reused if large enough — pass the same slice across calls for zero-GC.
+func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 	if len(bitmap) == 0 {
-		return nil
+		return dst[:0]
 	}
 
 	// estimate: assume ~1 transition per 64 bits on average
@@ -198,7 +206,12 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 	if estRuns < 16 {
 		estRuns = 16
 	}
-	result := make([]byte, 0, estRuns*5)
+	needed := int(estRuns * 5)
+	if cap(dst) >= needed {
+		dst = dst[:0]
+	} else {
+		dst = make([]byte, 0, needed)
+	}
 	var run [5]byte
 
 	currentBit := (bitmap[0] >> 7) & 1
@@ -221,8 +234,31 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 			if b == 0xFF {
 				runBit = 1
 			}
-			// count consecutive identical bytes
+			// count consecutive identical bytes — word-at-a-time
 			runBytes := uint64(1)
+			remaining := fullBytes - byteIdx - 1
+			scanBase := byteIdx + 1
+
+			// Use uint64 word scanning for long runs (8 bytes at a time)
+			if remaining >= 8 && scanBase < bitmapLen {
+				var wordTarget uint64
+				if b == 0xFF {
+					wordTarget = 0xFFFFFFFFFFFFFFFF
+				}
+				scanEnd := scanBase + remaining
+				if scanEnd > bitmapLen {
+					scanEnd = bitmapLen
+				}
+				for scanBase+runBytes+7 < scanEnd {
+					w := *(*uint64)(unsafe.Pointer(&bitmap[scanBase+runBytes]))
+					if w != wordTarget {
+						break
+					}
+					runBytes += 8
+				}
+			}
+
+			// finish byte-at-a-time for the tail
 			for byteIdx+runBytes < fullBytes {
 				var next byte
 				if byteIdx+runBytes < bitmapLen {
@@ -240,7 +276,7 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 			} else {
 				binary.BigEndian.PutUint32(run[0:4], count)
 				run[4] = currentBit
-				result = append(result, run[:]...)
+				dst = append(dst, run[:]...)
 				currentBit = runBit
 				count = uint32(runBytes * 8)
 			}
@@ -255,7 +291,7 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 			} else {
 				binary.BigEndian.PutUint32(run[0:4], count)
 				run[4] = currentBit
-				result = append(result, run[:]...)
+				dst = append(dst, run[:]...)
 				currentBit = bit
 				count = 1
 			}
@@ -278,7 +314,7 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 			} else {
 				binary.BigEndian.PutUint32(run[0:4], count)
 				run[4] = currentBit
-				result = append(result, run[:]...)
+				dst = append(dst, run[:]...)
 				currentBit = bit
 				count = 1
 			}
@@ -289,16 +325,26 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 	if count > 0 {
 		binary.BigEndian.PutUint32(run[0:4], count)
 		run[4] = currentBit
-		result = append(result, run[:]...)
+		dst = append(dst, run[:]...)
 	}
 
-	return result
+	return dst
 }
 
-// DecodeBitmapRLE decodes an RLE-encoded bitmap
+// DecodeBitmapRLE decodes an RLE-encoded bitmap.
+// dst is reused if large enough — pass the same slice across calls for zero-GC.
 func DecodeBitmapRLE(data []byte, totalBlocks uint64) ([]byte, error) {
+	return DecodeBitmapRLETo(nil, data, totalBlocks)
+}
+
+// DecodeBitmapRLETo is like DecodeBitmapRLE but reuses the dst buffer.
+func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 	bitmapSize := (totalBlocks + 7) / 8
-	bitmap := make([]byte, bitmapSize)
+	bitmap := grow(dst, int(bitmapSize))
+	// zero the buffer since we skip zero-runs
+	for i := range bitmap {
+		bitmap[i] = 0
+	}
 
 	pos := uint64(0)
 	offset := 0
