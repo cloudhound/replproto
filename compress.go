@@ -90,10 +90,21 @@ func grow(buf []byte, n int) []byte {
 }
 
 // IsZeroBlock checks if all bytes in the block are zero.
-// Uses uint64 comparisons for speed (~8x faster than byte-at-a-time).
+// Uses unrolled uint64 comparisons for speed.
 func IsZeroBlock(data []byte) bool {
 	n := len(data)
 	i := 0
+	// process 32 bytes per iteration (4 × uint64)
+	for i+32 <= n {
+		w0 := *(*uint64)(unsafe.Pointer(&data[i]))
+		w1 := *(*uint64)(unsafe.Pointer(&data[i+8]))
+		w2 := *(*uint64)(unsafe.Pointer(&data[i+16]))
+		w3 := *(*uint64)(unsafe.Pointer(&data[i+24]))
+		if (w0 | w1 | w2 | w3) != 0 {
+			return false
+		}
+		i += 32
+	}
 	for i+8 <= n {
 		if *(*uint64)(unsafe.Pointer(&data[i])) != 0 {
 			return false

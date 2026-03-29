@@ -91,11 +91,12 @@ func BenchmarkEncodeBitmapRLE_Sparse(b *testing.B) {
 	for i := 0; i < len(bitmap); i += 512 {
 		bitmap[i] = 0x80
 	}
+	var dst []byte
 
 	b.SetBytes(int64(len(bitmap)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		EncodeBitmapRLE(bitmap, totalBlocks)
+		dst = AppendBitmapRLE(dst, bitmap, totalBlocks)
 	}
 }
 
@@ -105,11 +106,12 @@ func BenchmarkEncodeBitmapRLE_Dense(b *testing.B) {
 	for i := range bitmap {
 		bitmap[i] = 0xFF
 	}
+	var dst []byte
 
 	b.SetBytes(int64(len(bitmap)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		EncodeBitmapRLE(bitmap, totalBlocks)
+		dst = AppendBitmapRLE(dst, bitmap, totalBlocks)
 	}
 }
 
@@ -120,11 +122,12 @@ func BenchmarkDecodeBitmapRLE(b *testing.B) {
 		bitmap[i] = 0xFF
 	}
 	encoded := EncodeBitmapRLE(bitmap, totalBlocks)
+	var dst []byte
 
 	b.SetBytes(int64(totalBlocks / 8))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		DecodeBitmapRLE(encoded, totalBlocks)
+		dst, _ = DecodeBitmapRLETo(dst, encoded, totalBlocks)
 	}
 }
 
