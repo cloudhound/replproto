@@ -5,28 +5,28 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/klauspost/compress/s2"
 )
 
 // encoding tag prefixes - first byte of every compressed payload
 const (
 	EncodingSparse byte = 0x02
-	EncodingLZ4    byte = 0x03
+	EncodingS2     byte = 0x05
 	EncodingRaw    byte = 0x04
 )
 
-// lz4BufPool reuses LZ4 output buffers to avoid per-call allocation.
-var lz4BufPool = sync.Pool{
+// s2BufPool reuses S2 output buffers to avoid per-call allocation.
+var s2BufPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 4096)
 		return &buf
 	},
 }
 
-// CompressBlock compresses a block using LZ4.
+// CompressBlock compresses a block using S2 (Snappy successor).
 // returns nil if the block is all zeros (zero-block optimization).
 // for blocks with large zero regions (sparse), uses sparse encoding which
-// skips zero runs entirely. falls back to raw storage if LZ4 can't compress.
+// skips zero runs entirely. falls back to raw storage if S2 expands the data.
 // the first byte of the returned slice is an encoding tag so the decoder
 // knows which format was used.
 func CompressBlock(data []byte) ([]byte, error) {
@@ -40,9 +40,17 @@ func CompressBlock(data []byte) ([]byte, error) {
 		return sparse, nil
 	}
 
-	// lz4 block compression with pooled output buffer
-	maxLen := lz4.CompressBlockBound(len(data))
-	bufp := lz4BufPool.Get().(*[]byte)
+	// S2 compression with pooled output buffer
+	maxLen := s2.MaxEncodedLen(len(data))
+	if maxLen <= 0 {
+		// input too large for S2 — store raw
+		out := make([]byte, 1+len(data))
+		out[0] = EncodingRaw
+		copy(out[1:], data)
+		return out, nil
+	}
+
+	bufp := s2BufPool.Get().(*[]byte)
 	buf := *bufp
 	needed := 1 + maxLen
 	if cap(buf) < needed {
@@ -50,24 +58,26 @@ func CompressBlock(data []byte) ([]byte, error) {
 	} else {
 		buf = buf[:needed]
 	}
-	buf[0] = EncodingLZ4
+	buf[0] = EncodingS2
 
-	n, err := lz4.CompressBlock(data, buf[1:], nil)
-	if err == nil && n > 0 {
-		out := make([]byte, 1+n)
-		copy(out, buf[:1+n])
+	compressed := s2.Encode(buf[1:], data)
+	if len(compressed) >= len(data) {
+		// S2 expanded the data — store raw
 		*bufp = buf
-		lz4BufPool.Put(bufp)
+		s2BufPool.Put(bufp)
+
+		out := make([]byte, 1+len(data))
+		out[0] = EncodingRaw
+		copy(out[1:], data)
 		return out, nil
 	}
 
-	*bufp = buf
-	lz4BufPool.Put(bufp)
+	out := make([]byte, 1+len(compressed))
+	out[0] = EncodingS2
+	copy(out[1:], compressed)
 
-	// LZ4 couldn't compress — store raw
-	out := make([]byte, 1+len(data))
-	out[0] = EncodingRaw
-	copy(out[1:], data)
+	*bufp = buf
+	s2BufPool.Put(bufp)
 	return out, nil
 }
 
@@ -89,13 +99,8 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	case EncodingSparse:
 		return decodeSparse(compressed[1:], uncompressedLen)
 
-	case EncodingLZ4:
-		buf := make([]byte, uncompressedLen)
-		n, err := lz4.UncompressBlock(compressed[1:], buf)
-		if err != nil {
-			return nil, fmt.Errorf("lz4 decompress: %w", err)
-		}
-		return buf[:n], nil
+	case EncodingS2:
+		return s2.Decode(nil, compressed[1:])
 
 	case EncodingRaw:
 		buf := make([]byte, uncompressedLen)
