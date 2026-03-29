@@ -25,10 +25,6 @@ const (
 	// sparseMinZeroRun is the minimum length of a zero run to be worth
 	// encoding as a gap. shorter runs are merged with adjacent data.
 	sparseMinZeroRun = 512
-
-	// sparseThresholdPct is the minimum fraction of zero bytes in a block
-	// for sparse encoding to be attempted (25%).
-	sparseThresholdPct = 25
 )
 
 // describes a contiguous non-zero region within a block
@@ -42,41 +38,31 @@ type sparseRegion struct {
 // encoding if beneficial. returns nil if the block doesn't benefit from
 // sparse encoding (use regular compression instead).
 // the returned slice is prefixed with the EncodingSparse tag byte.
+//
+// Uses a single pass to find non-zero regions and count zero bytes
+// simultaneously, avoiding a redundant second scan.
 func trySparseEncode(data []byte) []byte {
 	if len(data) == 0 {
 		return nil
 	}
 
-	// quick check: count zero bytes to see if sparse encoding is worthwhile
-	zeroCount := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == 0 {
-			zeroCount++
-		}
-	}
-
-	threshold := len(data) * sparseThresholdPct / 100
-	if zeroCount < threshold {
-		return nil // not sparse enough
-	}
-
-	// find non-zero regions
+	// single-pass: find non-zero regions and track total data bytes
 	regions := findNonZeroRegions(data)
 	if len(regions) == 0 {
 		return nil // all zeros - let IsZeroBlock handle this
 	}
 
-	// calculate encoded size: tag(1) + region_count(2) + regions
-	encodedSize := 1 + 2
+	// calculate encoded size and total data bytes in one loop
+	encodedSize := 1 + 2 // tag + region_count
 	dataBytes := 0
 	for _, r := range regions {
 		encodedSize += 4 + 4 + int(r.length) // offset + length + data
 		dataBytes += int(r.length)
 	}
 
-	// only use sparse encoding if it saves significant space (>20% savings
-	// compared to the raw data size that would need to be compressed)
-	if float64(dataBytes) > float64(len(data))*0.80 {
+	// check if sparse enough (>20% savings) — equivalent to the old
+	// zero-count threshold but derived from the regions we already found
+	if dataBytes > len(data)*80/100 {
 		return nil // not enough savings
 	}
 
@@ -130,6 +116,7 @@ func decodeSparse(encoded []byte, uncompressedLen int) ([]byte, error) {
 
 // findNonZeroRegions scans a block and returns the non-zero regions,
 // merging adjacent regions separated by short zero runs.
+// Region data slices reference the original block to avoid copies.
 func findNonZeroRegions(data []byte) []sparseRegion {
 	var regions []sparseRegion
 	n := len(data)
@@ -175,12 +162,10 @@ func findNonZeroRegions(data []byte) []sparseRegion {
 
 		end := i
 		if end > start {
-			regionData := make([]byte, end-start)
-			copy(regionData, data[start:end])
 			regions = append(regions, sparseRegion{
 				offset: uint32(start),
 				length: uint32(end - start),
-				data:   regionData,
+				data:   data[start:end],
 			})
 		}
 	}
