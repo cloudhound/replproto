@@ -69,6 +69,8 @@ func (e *FrameEncoder) EncodeFrame(w io.Writer, f Frame) error {
 		e.buf = e.buf[:frameSize]
 	}
 
+	// single bounds-check for the header region
+	_ = e.buf[8]
 	// magic
 	binary.BigEndian.PutUint32(e.buf[0:4], FrameMagic)
 	// type
@@ -125,11 +127,10 @@ func (d *FrameDecoder) DecodeFrame(r io.Reader) (Frame, error) {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
-	// verify crc32-c over header + payload — no allocation
-	expected := crc32.Update(
-		crc32.Update(0, castagnoliTable, d.header[:]),
-		castagnoliTable, d.buf[:payloadLen],
-	)
+	// verify crc32-c over header + payload using a single pass
+	// by checksumming the contiguous header, then continuing into payload
+	crcVal := crc32.Update(0, castagnoliTable, d.header[:])
+	expected := crc32.Update(crcVal, castagnoliTable, d.buf[:payloadLen])
 	got := binary.BigEndian.Uint32(d.buf[payloadLen:])
 	if got != expected {
 		return Frame{}, fmt.Errorf("crc mismatch: expected 0x%08X, got 0x%08X", expected, got)
@@ -161,6 +162,8 @@ func EncodeBlockDataPayload(dst []byte, h BlockDataHeader, compressedData []byte
 	} else {
 		dst = make([]byte, needed)
 	}
+	// single bounds-check elimination: reference element 21 to prove bounds
+	_ = dst[21]
 	binary.BigEndian.PutUint16(dst[0:2], h.DeviceID)
 	binary.BigEndian.PutUint64(dst[2:10], h.BlockOffset)
 	binary.BigEndian.PutUint32(dst[10:14], h.UncompressedLen)
@@ -176,6 +179,7 @@ func DecodeBlockDataPayload(data []byte) (BlockDataHeader, []byte, error) {
 	}
 
 	var h BlockDataHeader
+	_ = data[21] // single bounds-check elimination
 	h.DeviceID = binary.BigEndian.Uint16(data[0:2])
 	h.BlockOffset = binary.BigEndian.Uint64(data[2:10])
 	h.UncompressedLen = binary.BigEndian.Uint32(data[10:14])
@@ -212,7 +216,6 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 	} else {
 		dst = make([]byte, 0, needed)
 	}
-	var run [5]byte
 
 	currentBit := (bitmap[0] >> 7) & 1
 	count := uint32(0)
@@ -274,9 +277,7 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			if currentBit == runBit {
 				count += uint32(runBytes * 8)
 			} else {
-				binary.BigEndian.PutUint32(run[0:4], count)
-				run[4] = currentBit
-				dst = append(dst, run[:]...)
+				dst = appendRun(dst, count, currentBit)
 				currentBit = runBit
 				count = uint32(runBytes * 8)
 			}
@@ -289,9 +290,7 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			if bit == currentBit {
 				count++
 			} else {
-				binary.BigEndian.PutUint32(run[0:4], count)
-				run[4] = currentBit
-				dst = append(dst, run[:]...)
+				dst = appendRun(dst, count, currentBit)
 				currentBit = bit
 				count = 1
 			}
@@ -312,9 +311,7 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			if bit == currentBit {
 				count++
 			} else {
-				binary.BigEndian.PutUint32(run[0:4], count)
-				run[4] = currentBit
-				dst = append(dst, run[:]...)
+				dst = appendRun(dst, count, currentBit)
 				currentBit = bit
 				count = 1
 			}
@@ -323,12 +320,16 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 
 	// flush final run
 	if count > 0 {
-		binary.BigEndian.PutUint32(run[0:4], count)
-		run[4] = currentBit
-		dst = append(dst, run[:]...)
+		dst = appendRun(dst, count, currentBit)
 	}
 
 	return dst
+}
+
+// appendRun appends a 5-byte RLE run (count + value) to dst.
+// Inlineable — avoids the intermediate [5]byte array + slice copy.
+func appendRun(dst []byte, count uint32, value byte) []byte {
+	return append(dst, byte(count>>24), byte(count>>16), byte(count>>8), byte(count), value)
 }
 
 // DecodeBitmapRLE decodes an RLE-encoded bitmap.
@@ -341,10 +342,12 @@ func DecodeBitmapRLE(data []byte, totalBlocks uint64) ([]byte, error) {
 func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 	bitmapSize := (totalBlocks + 7) / 8
 	bitmap := grow(dst, int(bitmapSize))
-	// zero the buffer since we skip zero-runs
-	for i := range bitmap {
-		bitmap[i] = 0
-	}
+
+	// Instead of pre-zeroing the entire bitmap and only writing 1-runs,
+	// we write both 0-runs and 1-runs explicitly. This avoids the O(n)
+	// zeroing pass which is wasteful for dense (mostly-1) bitmaps.
+	// For reused buffers, we must write every byte since the buffer
+	// may contain stale data.
 
 	pos := uint64(0)
 	offset := 0
@@ -359,37 +362,52 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			end = totalBlocks
 		}
 
-		if value == 0 {
-			// bitmap is already zeroed — just advance
-			pos = end
-			continue
+		// Determine fill byte: 0x00 for zero-runs, 0xFF for one-runs
+		var fillByte byte
+		if value != 0 {
+			fillByte = 0xFF
 		}
 
-		// value == 1: set bits from pos to end
-		for pos < end {
-			byteIdx := pos >> 3
-			bitOff := 7 - (pos & 7)
-
-			if bitOff == 7 && pos+8 <= end {
-				// aligned and at least 8 bits: fill whole bytes using copy-doubling
-				fillBytes := (end - pos) >> 3
-				start := byteIdx
-				bitmap[start] = 0xFF
-				filled := uint64(1)
-				for filled < fillBytes {
-					n := fillBytes - filled
-					if n > filled {
-						n = filled
-					}
-					copy(bitmap[start+filled:start+filled+n], bitmap[start:start+filled])
-					filled += n
-				}
-				pos += fillBytes * 8
-				continue
+		// handle unaligned leading bits
+		for pos < end && (pos&7) != 0 {
+			if value != 0 {
+				bitmap[pos>>3] |= 1 << (7 - (pos & 7))
+			} else {
+				bitmap[pos>>3] &^= 1 << (7 - (pos & 7))
 			}
-
-			bitmap[byteIdx] |= 1 << bitOff
 			pos++
+		}
+
+		// bulk fill aligned whole bytes with memset pattern
+		if pos+8 <= end {
+			startByte := pos >> 3
+			fillBytes := (end - pos) >> 3
+			region := bitmap[startByte : startByte+fillBytes]
+			for i := range region {
+				region[i] = fillByte
+			}
+			pos += fillBytes * 8
+		}
+
+		// handle unaligned trailing bits
+		for pos < end {
+			if value != 0 {
+				bitmap[pos>>3] |= 1 << (7 - (pos & 7))
+			} else {
+				bitmap[pos>>3] &^= 1 << (7 - (pos & 7))
+			}
+			pos++
+		}
+	}
+
+	// zero any remaining bytes beyond the last run
+	if pos < totalBlocks {
+		startByte := (pos + 7) / 8
+		if startByte < uint64(len(bitmap)) {
+			tail := bitmap[startByte:]
+			for i := range tail {
+				tail[i] = 0
+			}
 		}
 	}
 
