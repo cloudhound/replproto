@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"net"
 	"unsafe"
 )
@@ -224,41 +225,6 @@ func DecodeBlockDataPayload(data []byte) (BlockDataHeader, []byte, error) {
 
 // rle bitmap encoding for BLOCK_BITMAP messages
 
-// rleByteScan holds precomputed run-length data for a single byte value.
-// Used to replace the O(8) bit-by-bit scan with an O(transitions) table lookup.
-type rleByteScan struct {
-	nRuns    uint8
-	firstBit byte
-	lengths  [8]uint8
-}
-
-var rleByteTable [256]rleByteScan
-
-func init() {
-	for i := 0; i < 256; i++ {
-		b := byte(i)
-		var s rleByteScan
-		s.firstBit = (b >> 7) & 1
-		cur := s.firstBit
-		runLen := uint8(0)
-		idx := 0
-		for bit := 7; bit >= 0; bit-- {
-			v := (b >> uint(bit)) & 1
-			if v == cur {
-				runLen++
-			} else {
-				s.lengths[idx] = runLen
-				idx++
-				cur = v
-				runLen = 1
-			}
-		}
-		s.lengths[idx] = runLen
-		s.nRuns = uint8(idx + 1)
-		rleByteTable[i] = s
-	}
-}
-
 // EncodeBitmapRLE encodes a bitmap using run-length encoding.
 // each run is: [4-byte count][1-byte value (0 or 1)]
 // dst is reused if large enough — pass the same slice across calls for zero-GC.
@@ -352,20 +318,28 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			continue
 		}
 
-		// table-driven path: O(transitions) per byte instead of O(8)
-		info := &rleByteTable[b]
-		runBit := info.firstBit
-		if runBit == currentBit {
-			count += uint32(info.lengths[0])
-		} else {
-			dst = appendRun(dst, count, currentBit)
-			currentBit = runBit
-			count = uint32(info.lengths[0])
-		}
-		for ri := uint8(1); ri < info.nRuns; ri++ {
-			dst = appendRun(dst, count, currentBit)
-			currentBit ^= 1
-			count = uint32(info.lengths[ri])
+		// slow path: mixed byte — use CLZ to find runs in O(transitions) instead of O(8)
+		bitsLeft := uint(8)
+		for bitsLeft > 0 {
+			// Build a mask where matching bits are 0 and differing bits are 1,
+			// shifted so the remaining bits occupy the MSB of the byte.
+			var mask uint8
+			if currentBit == 1 {
+				mask = 0xFF
+			}
+			diff := (b << (8 - bitsLeft)) ^ mask
+			run := uint(bits.LeadingZeros8(diff))
+			if run > bitsLeft {
+				run = bitsLeft
+			}
+			count += uint32(run)
+			bitsLeft -= run
+			if bitsLeft > 0 {
+				// transition: emit current run and flip
+				dst = appendRun(dst, count, currentBit)
+				currentBit ^= 1
+				count = 0
+			}
 		}
 	}
 
