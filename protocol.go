@@ -151,15 +151,21 @@ type BlockDataHeader struct {
 // BlockDataHeaderSize is the byte size of a serialized BlockDataHeader
 const BlockDataHeaderSize = 2 + 8 + 4 + 8 // 22 bytes
 
-// EncodeBlockDataPayload builds a BLOCK_DATA payload from header + compressed data
-func EncodeBlockDataPayload(h BlockDataHeader, compressedData []byte) []byte {
-	buf := make([]byte, BlockDataHeaderSize+len(compressedData))
-	binary.BigEndian.PutUint16(buf[0:2], h.DeviceID)
-	binary.BigEndian.PutUint64(buf[2:10], h.BlockOffset)
-	binary.BigEndian.PutUint32(buf[10:14], h.UncompressedLen)
-	copy(buf[14:22], h.Checksum[:])
-	copy(buf[22:], compressedData)
-	return buf
+// EncodeBlockDataPayload builds a BLOCK_DATA payload from header + compressed data.
+// dst is reused if large enough — pass the same slice across calls for zero-GC.
+func EncodeBlockDataPayload(dst []byte, h BlockDataHeader, compressedData []byte) []byte {
+	needed := BlockDataHeaderSize + len(compressedData)
+	if cap(dst) >= needed {
+		dst = dst[:needed]
+	} else {
+		dst = make([]byte, needed)
+	}
+	binary.BigEndian.PutUint16(dst[0:2], h.DeviceID)
+	binary.BigEndian.PutUint64(dst[2:10], h.BlockOffset)
+	binary.BigEndian.PutUint32(dst[10:14], h.UncompressedLen)
+	copy(dst[14:22], h.Checksum[:])
+	copy(dst[22:], compressedData)
+	return dst
 }
 
 // DecodeBlockDataPayload parses a BLOCK_DATA payload
@@ -202,34 +208,41 @@ func EncodeBitmapRLE(bitmap []byte, totalBlocks uint64) []byte {
 	fullBytes := totalBlocks / 8
 	tailBits := totalBlocks & 7
 
+	bitmapLen := uint64(len(bitmap))
 	for byteIdx := uint64(0); byteIdx < fullBytes; byteIdx++ {
 		var b byte
-		if byteIdx < uint64(len(bitmap)) {
+		if byteIdx < bitmapLen {
 			b = bitmap[byteIdx]
 		}
 
-		// fast path: entire byte is all-0 or all-1
-		if b == 0x00 {
-			if currentBit == 0 {
-				count += 8
-			} else {
-				binary.BigEndian.PutUint32(run[0:4], count)
-				run[4] = currentBit
-				result = append(result, run[:]...)
-				currentBit = 0
-				count = 8
+		// fast path: scan runs of consecutive 0x00 or 0xFF bytes
+		if b == 0x00 || b == 0xFF {
+			runBit := byte(0)
+			if b == 0xFF {
+				runBit = 1
 			}
-			continue
-		}
-		if b == 0xFF {
-			if currentBit == 1 {
-				count += 8
+			// count consecutive identical bytes
+			runBytes := uint64(1)
+			for byteIdx+runBytes < fullBytes {
+				var next byte
+				if byteIdx+runBytes < bitmapLen {
+					next = bitmap[byteIdx+runBytes]
+				}
+				if next != b {
+					break
+				}
+				runBytes++
+			}
+			byteIdx += runBytes - 1 // outer loop increments
+
+			if currentBit == runBit {
+				count += uint32(runBytes * 8)
 			} else {
 				binary.BigEndian.PutUint32(run[0:4], count)
 				run[4] = currentBit
 				result = append(result, run[:]...)
-				currentBit = 1
-				count = 8
+				currentBit = runBit
+				count = uint32(runBytes * 8)
 			}
 			continue
 		}
@@ -312,12 +325,20 @@ func DecodeBitmapRLE(data []byte, totalBlocks uint64) ([]byte, error) {
 			bitOff := 7 - (pos & 7)
 
 			if bitOff == 7 && pos+8 <= end {
-				// aligned and at least 8 bits: fill whole bytes
-				fillEnd := (end - pos) >> 3 // number of full bytes
-				for j := uint64(0); j < fillEnd; j++ {
-					bitmap[byteIdx+j] = 0xFF
+				// aligned and at least 8 bits: fill whole bytes using copy-doubling
+				fillBytes := (end - pos) >> 3
+				start := byteIdx
+				bitmap[start] = 0xFF
+				filled := uint64(1)
+				for filled < fillBytes {
+					n := fillBytes - filled
+					if n > filled {
+						n = filled
+					}
+					copy(bitmap[start+filled:start+filled+n], bitmap[start:start+filled])
+					filled += n
 				}
-				pos += fillEnd * 8
+				pos += fillBytes * 8
 				continue
 			}
 
