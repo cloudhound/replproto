@@ -5,72 +5,63 @@ import (
 	"compress/flate"
 	"fmt"
 	"io"
-	"sync"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // encoding tag prefixes - first byte of every compressed payload
 const (
-	encodingFlate  byte = 0x01
-	encodingSparse byte = 0x02
+	EncodingFlate  byte = 0x01
+	EncodingSparse byte = 0x02
+	EncodingLZ4    byte = 0x03
 )
 
-// compressorPool reuses flate writers to avoid allocating a new compressor
-// for every 1 MiB block across 32 workers.
-var compressorPool = sync.Pool{
-	New: func() any {
-		w, _ := flate.NewWriter(nil, flate.BestSpeed)
-		return w
-	},
-}
-
-// CompressBlock compresses a block using the best available method.
+// CompressBlock compresses a block using LZ4.
 // returns nil if the block is all zeros (zero-block optimization).
 // for blocks with large zero regions (sparse), uses sparse encoding which
-// skips zero runs entirely. otherwise uses flate level 1 compression.
+// skips zero runs entirely. falls back to flate if LZ4 can't compress.
 // the first byte of the returned slice is an encoding tag so the decoder
-// knows which format was used without magic-byte sniffing.
+// knows which format was used.
 func CompressBlock(data []byte) ([]byte, error) {
 	if IsZeroBlock(data) {
-		return nil, nil // zero block - no data to send
+		return nil, nil
 	}
 
 	// try sparse encoding first - beneficial for VM disks, database files,
 	// and NTFS sparse files where allocated blocks contain large zero regions
 	if sparse := trySparseEncode(data); sparse != nil {
-		// compare sparse size with flate to pick the smaller one
-		flateData, err := flateCompress(data)
-		if err != nil {
-			return sparse, nil // flate failed, use sparse
-		}
-		if len(sparse) < len(flateData) {
-			return sparse, nil
-		}
-		return flateData, nil
+		return sparse, nil
 	}
 
+	// lz4 block compression
+	maxLen := lz4.CompressBlockBound(len(data))
+	buf := make([]byte, 1+maxLen)
+	buf[0] = EncodingLZ4
+	n, err := lz4.CompressBlock(data, buf[1:], nil)
+	if err == nil && n > 0 {
+		return buf[:1+n], nil
+	}
+
+	// lz4 couldn't compress (incompressible data), fall back to flate
 	return flateCompress(data)
 }
 
 // flateCompress compresses data using flate level 1 (fastest).
-// the output is prefixed with encodingFlate tag byte.
+// the output is prefixed with EncodingFlate tag byte.
 func flateCompress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(encodingFlate)
+	buf.WriteByte(EncodingFlate)
 
-	w := compressorPool.Get().(*flate.Writer)
-	w.Reset(&buf)
+	w, _ := flate.NewWriter(&buf, flate.BestSpeed)
 
 	if _, err := w.Write(data); err != nil {
-		compressorPool.Put(w)
 		return nil, fmt.Errorf("compress: %w", err)
 	}
 
 	if err := w.Close(); err != nil {
-		compressorPool.Put(w)
 		return nil, fmt.Errorf("close compressor: %w", err)
 	}
 
-	compressorPool.Put(w)
 	return buf.Bytes(), nil
 }
 
@@ -89,10 +80,18 @@ func DecompressBlock(compressed []byte, uncompressedLen int) ([]byte, error) {
 	}
 
 	switch compressed[0] {
-	case encodingSparse:
+	case EncodingSparse:
 		return decodeSparse(compressed[1:], uncompressedLen)
 
-	case encodingFlate:
+	case EncodingLZ4:
+		buf := make([]byte, uncompressedLen)
+		n, err := lz4.UncompressBlock(compressed[1:], buf)
+		if err != nil {
+			return nil, fmt.Errorf("lz4 decompress: %w", err)
+		}
+		return buf[:n], nil
+
+	case EncodingFlate:
 		r := flate.NewReader(bytes.NewReader(compressed[1:]))
 		defer r.Close()
 

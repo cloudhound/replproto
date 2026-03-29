@@ -12,7 +12,7 @@ import (
 // encoding is more efficient than flate compression because it can skip zero
 // runs entirely rather than compressing them.
 //
-// sparse payload format (after the encodingSparse tag byte):
+// sparse payload format (after the EncodingSparse tag byte):
 //   [RegionCount(2)] [Region...]
 //
 // region format:
@@ -41,7 +41,7 @@ type sparseRegion struct {
 // trySparseEncode analyzes a block for zero regions and returns a sparse
 // encoding if beneficial. returns nil if the block doesn't benefit from
 // sparse encoding (use regular compression instead).
-// the returned slice is prefixed with the encodingSparse tag byte.
+// the returned slice is prefixed with the EncodingSparse tag byte.
 func trySparseEncode(data []byte) []byte {
 	if len(data) == 0 {
 		return nil
@@ -82,7 +82,7 @@ func trySparseEncode(data []byte) []byte {
 
 	// encode
 	buf := make([]byte, encodedSize)
-	buf[0] = encodingSparse
+	buf[0] = EncodingSparse
 	binary.BigEndian.PutUint16(buf[1:3], uint16(len(regions)))
 
 	offset := 3
