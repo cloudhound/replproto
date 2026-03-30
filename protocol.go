@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"io"
 	"math/bits"
+	"net"
 	"unsafe"
 )
 
@@ -46,46 +47,78 @@ type Frame struct {
 	Payload []byte
 }
 
-// FrameEncoder holds a reusable buffer for encoding frames.
+// FrameEncoder holds reusable state for encoding frames.
 // Allocate one per goroutine for zero-GC frame encoding.
 type FrameEncoder struct {
-	buf []byte
+	hdr  [FrameHeaderSize]byte
+	crc  [FrameCRCSize]byte
+	bufs [3][]byte
 }
 
-// EncodeFrame writes a frame to the given writer.
-// The internal buffer is reused across calls — zero allocations
-// after the first call with the largest frame size.
+// EncodeFrame writes a frame to the given writer using vectored IO.
+// For *net.TCPConn this uses writev(2), avoiding the O(payload) copy
+// into a contiguous buffer. For other writers, individual writes are
+// performed (still no payload copy). Zero allocations after first call.
 func (e *FrameEncoder) EncodeFrame(w io.Writer, f Frame) error {
 	payloadLen := len(f.Payload)
 	if payloadLen > MaxPayloadSize {
 		return fmt.Errorf("payload too large: %d > %d", payloadLen, MaxPayloadSize)
 	}
 
-	// build the frame: magic + type + length + payload + crc
-	frameSize := FrameHeaderSize + payloadLen + FrameCRCSize
+	// build header
+	_ = e.hdr[8]
+	binary.BigEndian.PutUint32(e.hdr[0:4], FrameMagic)
+	e.hdr[4] = f.Type
+	binary.BigEndian.PutUint32(e.hdr[5:9], uint32(payloadLen))
 
-	if cap(e.buf) < frameSize {
-		e.buf = make([]byte, frameSize)
-	} else {
-		e.buf = e.buf[:frameSize]
+	// crc32-c over header + payload without copying payload
+	crc := crc32.Update(0, castagnoliTable, e.hdr[:])
+	crc = crc32.Update(crc, castagnoliTable, f.Payload)
+	binary.BigEndian.PutUint32(e.crc[:], crc)
+
+	// vectored write: writev(2) for net.TCPConn, sequential for others
+	e.bufs[0] = e.hdr[:]
+	e.bufs[1] = f.Payload
+	e.bufs[2] = e.crc[:]
+	bufs := net.Buffers(e.bufs[:])
+	_, err := bufs.WriteTo(w)
+	return err
+}
+
+// FrameData holds a prepared frame for deferred or zero-copy writing.
+// It implements io.WriterTo — when writing to a *net.TCPConn, the
+// kernel coalesces the header, payload, and CRC via writev(2).
+type FrameData struct {
+	hdr     [FrameHeaderSize]byte
+	payload []byte
+	crc     [FrameCRCSize]byte
+}
+
+// WriteTo implements io.WriterTo using vectored IO when available.
+func (fd *FrameData) WriteTo(w io.Writer) (int64, error) {
+	bufs := net.Buffers{fd.hdr[:], fd.payload, fd.crc[:]}
+	return bufs.WriteTo(w)
+}
+
+// PrepareFrame builds a FrameData for deferred writing.
+// The returned FrameData references f.Payload directly — the caller
+// must keep it valid until WriteTo completes.
+func (e *FrameEncoder) PrepareFrame(f Frame) (*FrameData, error) {
+	payloadLen := len(f.Payload)
+	if payloadLen > MaxPayloadSize {
+		return nil, fmt.Errorf("payload too large: %d > %d", payloadLen, MaxPayloadSize)
 	}
 
-	// single bounds-check for the header region
-	_ = e.buf[8]
-	// magic
-	binary.BigEndian.PutUint32(e.buf[0:4], FrameMagic)
-	// type
-	e.buf[4] = f.Type
-	// payload length
-	binary.BigEndian.PutUint32(e.buf[5:9], uint32(payloadLen))
-	// payload
-	copy(e.buf[9:9+payloadLen], f.Payload)
-	// crc32-c of everything before the crc
-	crc := crc32.Checksum(e.buf[:9+payloadLen], castagnoliTable)
-	binary.BigEndian.PutUint32(e.buf[9+payloadLen:], crc)
+	fd := &FrameData{payload: f.Payload}
+	binary.BigEndian.PutUint32(fd.hdr[0:4], FrameMagic)
+	fd.hdr[4] = f.Type
+	binary.BigEndian.PutUint32(fd.hdr[5:9], uint32(payloadLen))
 
-	_, err := w.Write(e.buf)
-	return err
+	crc := crc32.Update(0, castagnoliTable, fd.hdr[:])
+	crc = crc32.Update(crc, castagnoliTable, f.Payload)
+	binary.BigEndian.PutUint32(fd.crc[:], crc)
+
+	return fd, nil
 }
 
 // FrameDecoder holds reusable buffers for decoding frames.
@@ -388,23 +421,11 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			pos++
 		}
 
-		// bulk fill aligned whole bytes
-		// Split into constant-value branches so the compiler emits
-		// memclr (for 0x00) or a vectorized memset (for 0xFF)
-		// instead of a byte-at-a-time store loop.
+		// bulk fill aligned whole bytes using page-copy memset
 		if pos+8 <= end {
 			startByte := pos >> 3
 			fillBytes := (end - pos) >> 3
-			region := bitmap[startByte : startByte+fillBytes]
-			if fillByte == 0xFF {
-				for i := range region {
-					region[i] = 0xFF
-				}
-			} else {
-				for i := range region {
-					region[i] = 0
-				}
-			}
+			memset(bitmap[startByte:startByte+fillBytes], fillByte)
 			pos += fillBytes * 8
 		}
 
@@ -423,10 +444,7 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 	if pos < totalBlocks {
 		startByte := (pos + 7) / 8
 		if startByte < uint64(len(bitmap)) {
-			tail := bitmap[startByte:]
-			for i := range tail {
-				tail[i] = 0
-			}
+			memset(bitmap[startByte:], 0)
 		}
 	}
 
