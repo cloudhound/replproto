@@ -16,16 +16,23 @@ const (
 
 // CompressBlock compresses src into dst using S2 and computes the XXH64
 // checksum in a single pass over src. dst is reused if large enough.
+// if checksum is non-zero it is used as-is (caller already computed it).
 // returns (nil, zero-checksum, nil) if the block is all zeros.
-func CompressBlock(dst, src []byte) ([]byte, [ChecksumSize]byte, error) {
-	var checksum [ChecksumSize]byte
-
-	if IsZeroBlock(src) {
-		return dst[:0], checksum, nil
+func CompressBlock(dst, src []byte, checksum ...[ChecksumSize]byte) ([]byte, [ChecksumSize]byte, error) {
+	var cs [ChecksumSize]byte
+	if len(checksum) > 0 {
+		cs = checksum[0]
 	}
 
-	// compute checksum while we still have the uncompressed data
-	binary.BigEndian.PutUint64(checksum[:], xxhash.Sum64(src))
+	if IsZeroBlock(src) {
+		return dst[:0], cs, nil
+	}
+
+	// compute checksum if not provided
+	var zero [ChecksumSize]byte
+	if cs == zero {
+		binary.BigEndian.PutUint64(cs[:], xxhash.Sum64(src))
+	}
 
 	maxLen := s2.MaxEncodedLen(len(src))
 	if maxLen <= 0 {
@@ -34,7 +41,7 @@ func CompressBlock(dst, src []byte) ([]byte, [ChecksumSize]byte, error) {
 		dst = grow(dst, needed)
 		dst[0] = EncodingRaw
 		copy(dst[1:], src)
-		return dst[:needed], checksum, nil
+		return dst[:needed], cs, nil
 	}
 
 	needed := 1 + maxLen
@@ -46,10 +53,10 @@ func CompressBlock(dst, src []byte) ([]byte, [ChecksumSize]byte, error) {
 		// S2 expanded the data - store raw
 		dst[0] = EncodingRaw
 		copy(dst[1:], src)
-		return dst[:1+len(src)], checksum, nil
+		return dst[:1+len(src)], cs, nil
 	}
 
-	return dst[:1+len(compressed)], checksum, nil
+	return dst[:1+len(compressed)], cs, nil
 }
 
 // DecompressBlock decompresses src into dst and optionally verifies the
