@@ -1030,6 +1030,383 @@ func TestEndToEndBitmapVariousDensities(t *testing.T) {
 	}
 }
 
+// ---------- PrepareFrame / FrameData ----------
+
+func TestPrepareFrameRoundTrip(t *testing.T) {
+	enc := &FrameEncoder{}
+	dec := &FrameDecoder{}
+
+	sizes := []int{0, 1, 22, 4096, 64 * 1024}
+	for _, sz := range sizes {
+		t.Run(fmt.Sprintf("size=%d", sz), func(t *testing.T) {
+			payload := make([]byte, sz)
+			if sz > 0 {
+				rand.Read(payload)
+			}
+
+			fd, err := enc.PrepareFrame(Frame{Type: MsgBlockData, Payload: payload})
+			if err != nil {
+				t.Fatalf("PrepareFrame: %v", err)
+			}
+
+			var buf bytes.Buffer
+			if _, err := fd.WriteTo(&buf); err != nil {
+				t.Fatalf("WriteTo: %v", err)
+			}
+
+			got, err := dec.DecodeFrame(&buf)
+			if err != nil {
+				t.Fatalf("DecodeFrame: %v", err)
+			}
+			if got.Type != MsgBlockData {
+				t.Errorf("type: got 0x%02X, want 0x%02X", got.Type, MsgBlockData)
+			}
+			if !bytes.Equal(got.Payload, payload) {
+				t.Errorf("payload mismatch (len got %d, want %d)", len(got.Payload), len(payload))
+			}
+		})
+	}
+}
+
+func TestPrepareFramePayloadTooLarge(t *testing.T) {
+	enc := &FrameEncoder{}
+	_, err := enc.PrepareFrame(Frame{Type: MsgBlockData, Payload: make([]byte, MaxPayloadSize+1)})
+	if err == nil {
+		t.Fatal("expected error for oversized payload")
+	}
+}
+
+func TestPrepareFrameMatchesEncodeFrame(t *testing.T) {
+	enc := &FrameEncoder{}
+	payload := randBytes(512)
+	f := Frame{Type: MsgChecksumMap, Payload: payload}
+
+	// encode via EncodeFrame
+	var buf1 bytes.Buffer
+	if err := enc.EncodeFrame(&buf1, f); err != nil {
+		t.Fatal(err)
+	}
+
+	// encode via PrepareFrame + WriteTo
+	fd, err := enc.PrepareFrame(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf2 bytes.Buffer
+	if _, err := fd.WriteTo(&buf2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(buf1.Bytes(), buf2.Bytes()) {
+		t.Error("PrepareFrame wire output differs from EncodeFrame")
+	}
+}
+
+// ---------- Frame decode edge cases ----------
+
+func TestFrameDecodePayloadLengthAtMax(t *testing.T) {
+	// craft a header that claims payload length = MaxPayloadSize+1
+	dec := &FrameDecoder{}
+	var hdr [FrameHeaderSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], FrameMagic)
+	hdr[4] = MsgBlockData
+	binary.BigEndian.PutUint32(hdr[5:9], MaxPayloadSize+1)
+
+	_, err := dec.DecodeFrame(bytes.NewReader(hdr[:]))
+	if err == nil {
+		t.Fatal("expected error for payload length exceeding max")
+	}
+}
+
+func TestFrameDecodeCRCCorruptionInHeader(t *testing.T) {
+	enc := &FrameEncoder{}
+	dec := &FrameDecoder{}
+
+	payload := []byte("test payload")
+	var buf bytes.Buffer
+	enc.EncodeFrame(&buf, Frame{Type: MsgAuth, Payload: payload})
+
+	raw := buf.Bytes()
+	// flip a bit in the type field (header region, not payload)
+	raw[4] ^= 0x01
+
+	_, err := dec.DecodeFrame(bytes.NewReader(raw))
+	if err == nil {
+		t.Fatal("expected CRC error for header corruption")
+	}
+}
+
+func TestFrameDecodeCRCCorruptionInCRC(t *testing.T) {
+	enc := &FrameEncoder{}
+	dec := &FrameDecoder{}
+
+	payload := []byte("test payload")
+	var buf bytes.Buffer
+	enc.EncodeFrame(&buf, Frame{Type: MsgAuth, Payload: payload})
+
+	raw := buf.Bytes()
+	// flip last byte (the CRC itself)
+	raw[len(raw)-1] ^= 0xFF
+
+	_, err := dec.DecodeFrame(bytes.NewReader(raw))
+	if err == nil {
+		t.Fatal("expected CRC error for corrupted CRC field")
+	}
+}
+
+func TestFrameDecodeHeaderTruncated(t *testing.T) {
+	dec := &FrameDecoder{}
+	// only 5 bytes of a 9-byte header
+	partial := make([]byte, 5)
+	binary.BigEndian.PutUint32(partial[0:4], FrameMagic)
+	partial[4] = MsgHeartbeat
+
+	_, err := dec.DecodeFrame(bytes.NewReader(partial))
+	if err == nil {
+		t.Fatal("expected error for truncated header")
+	}
+}
+
+// ---------- Bitmap RLE decode edge cases ----------
+
+func TestBitmapRLEDecodeEmptyData(t *testing.T) {
+	// empty encoded data with non-zero totalBlocks should produce a zeroed bitmap
+	decoded, err := DecodeBitmapRLE(nil, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(0); i < 64; i++ {
+		if getBit(decoded, i) != 0 {
+			t.Fatalf("bit %d should be 0 for empty encoded data", i)
+		}
+	}
+}
+
+func TestBitmapRLEDecodeTruncatedRun(t *testing.T) {
+	// 3 bytes of a 5-byte run should be ignored (offset+5 > len check)
+	truncated := []byte{0x00, 0x00, 0x08}
+	decoded, err := DecodeBitmapRLE(truncated, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// should produce zeroed bitmap since the partial run is skipped
+	for i := uint64(0); i < 64; i++ {
+		if getBit(decoded, i) != 0 {
+			t.Fatalf("bit %d should be 0 for truncated run data", i)
+		}
+	}
+}
+
+func TestBitmapRLEDecodeRunExceedsTotalBlocks(t *testing.T) {
+	// encode a run of 1000 bits, but decode with totalBlocks=64
+	// the run should be clamped to totalBlocks
+	var encoded []byte
+	encoded = appendRun(encoded, 1000, 1)
+
+	decoded, err := DecodeBitmapRLE(encoded, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(0); i < 64; i++ {
+		if getBit(decoded, i) != 1 {
+			t.Fatalf("bit %d should be 1", i)
+		}
+	}
+	// bitmap should be exactly 8 bytes (64/8)
+	if len(decoded) != 8 {
+		t.Errorf("bitmap size: got %d, want 8", len(decoded))
+	}
+}
+
+func TestBitmapRLEDecodeMultipleRunsExceedTotalBlocks(t *testing.T) {
+	// two runs that together exceed totalBlocks
+	var encoded []byte
+	encoded = appendRun(encoded, 32, 1)
+	encoded = appendRun(encoded, 1000, 0) // second run overshoots
+
+	decoded, err := DecodeBitmapRLE(encoded, 48)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(0); i < 32; i++ {
+		if getBit(decoded, i) != 1 {
+			t.Fatalf("bit %d should be 1", i)
+		}
+	}
+	for i := uint64(32); i < 48; i++ {
+		if getBit(decoded, i) != 0 {
+			t.Fatalf("bit %d should be 0", i)
+		}
+	}
+}
+
+func TestBitmapRLERandomRoundTrip(t *testing.T) {
+	// fuzz-like: random bitmaps at various sizes including non-byte-aligned
+	for _, totalBlocks := range []uint64{1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 500, 1023, 1024, 4095, 4096} {
+		bitmapSize := (totalBlocks + 7) / 8
+		bitmap := make([]byte, bitmapSize)
+		rand.Read(bitmap)
+		// clear bits beyond totalBlocks in the last byte
+		if totalBlocks%8 != 0 {
+			bitmap[len(bitmap)-1] &= ^byte(0xFF >> (totalBlocks % 8))
+		}
+
+		encoded := EncodeBitmapRLE(bitmap, totalBlocks)
+		decoded, err := DecodeBitmapRLE(encoded, totalBlocks)
+		if err != nil {
+			t.Fatalf("totalBlocks=%d: %v", totalBlocks, err)
+		}
+		for i := uint64(0); i < totalBlocks; i++ {
+			if getBit(decoded, i) != getBit(bitmap, i) {
+				t.Fatalf("totalBlocks=%d bit %d: got %d, want %d", totalBlocks, i, getBit(decoded, i), getBit(bitmap, i))
+			}
+		}
+	}
+}
+
+// ---------- isZeroBlockGeneric ----------
+
+func TestIsZeroBlockGeneric(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"nil", nil, true},
+		{"empty", []byte{}, true},
+		{"single_zero", []byte{0}, true},
+		{"single_nonzero", []byte{1}, false},
+		{"all_zero_4k", make([]byte, 4096), true},
+		{"last_byte_set", append(make([]byte, 4095), 0x01), false},
+		{"first_byte_set", append([]byte{0x01}, make([]byte, 4095)...), false},
+		{"size_7", make([]byte, 7), true},
+		{"size_9", make([]byte, 9), true},
+		{"size_31", make([]byte, 31), true},
+		{"size_33", make([]byte, 33), true},
+		// sizes that exercise each loop stage
+		{"size_8_nonzero_last", func() []byte {
+			b := make([]byte, 8)
+			b[7] = 1
+			return b
+		}(), false},
+		{"size_32_nonzero_last_word", func() []byte {
+			b := make([]byte, 32)
+			b[24] = 1
+			return b
+		}(), false},
+		{"size_40_tail", func() []byte {
+			b := make([]byte, 40)
+			b[39] = 1
+			return b
+		}(), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isZeroBlockGeneric(tt.data); got != tt.want {
+				t.Errorf("isZeroBlockGeneric: got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------- DecompressBlock buffer reuse ----------
+
+func TestDecompressBlockBufferReuse(t *testing.T) {
+	src1 := randBytes(4096)
+	src2 := randBytes(4096)
+
+	comp1, _ := CompressBlock(nil, src1)
+	comp2, _ := CompressBlock(nil, src2)
+
+	dst, err := DecompressBlock(nil, comp1, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dst, src1) {
+		t.Fatal("first decompress mismatch")
+	}
+
+	// reuse dst for second decompress
+	dst, err = DecompressBlock(dst, comp2, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dst, src2) {
+		t.Fatal("second decompress mismatch after buffer reuse")
+	}
+}
+
+func TestDecompressBlockRawEncoding(t *testing.T) {
+	// manually craft a raw-encoded payload
+	src := randBytes(100)
+	raw := make([]byte, 1+len(src))
+	raw[0] = EncodingRaw
+	copy(raw[1:], src)
+
+	dst, err := DecompressBlock(nil, raw, len(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dst, src) {
+		t.Error("raw encoding decompress mismatch")
+	}
+}
+
+// ---------- memset ----------
+
+func TestMemset(t *testing.T) {
+	// test zero fill
+	buf := bytes.Repeat([]byte{0xAA}, 8192)
+	memset(buf, 0)
+	for i, b := range buf {
+		if b != 0 {
+			t.Fatalf("memset(0): byte %d = 0x%02X, want 0x00", i, b)
+		}
+	}
+
+	// test 0xFF fill
+	memset(buf, 0xFF)
+	for i, b := range buf {
+		if b != 0xFF {
+			t.Fatalf("memset(0xFF): byte %d = 0x%02X, want 0xFF", i, b)
+		}
+	}
+
+	// test odd-sized buffer (not page-aligned)
+	small := make([]byte, 137)
+	memset(small, 0xFF)
+	for i, b := range small {
+		if b != 0xFF {
+			t.Fatalf("memset small: byte %d = 0x%02X, want 0xFF", i, b)
+		}
+	}
+}
+
+// ---------- grow helper ----------
+
+func TestGrow(t *testing.T) {
+	// nil buffer
+	buf := grow(nil, 10)
+	if len(buf) != 10 {
+		t.Fatalf("grow(nil, 10): len=%d", len(buf))
+	}
+
+	// reuse existing capacity
+	buf = make([]byte, 5, 100)
+	result := grow(buf, 50)
+	if len(result) != 50 || cap(result) != 100 {
+		t.Fatalf("grow reuse: len=%d cap=%d, want len=50 cap=100", len(result), cap(result))
+	}
+
+	// must allocate new buffer
+	buf = make([]byte, 5, 10)
+	result = grow(buf, 20)
+	if len(result) != 20 {
+		t.Fatalf("grow new alloc: len=%d, want 20", len(result))
+	}
+}
+
 // ---------- helpers ----------
 
 func randBytes(n int) []byte {
