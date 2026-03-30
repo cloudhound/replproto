@@ -257,89 +257,68 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 
 	currentBit := (bitmap[0] >> 7) & 1
 	count := uint32(0)
-
-	// number of full bytes covered by totalBlocks
-	fullBytes := totalBlocks / 8
-	tailBits := totalBlocks & 7
-
 	bitmapLen := uint64(len(bitmap))
-	for byteIdx := uint64(0); byteIdx < fullBytes; byteIdx++ {
-		var b byte
-		if byteIdx < bitmapLen {
-			b = bitmap[byteIdx]
-		}
 
-		// fast path: scan runs of consecutive 0x00 or 0xFF bytes
-		if b == 0x00 || b == 0xFF {
+	// Process in 64-bit (8-byte) words for O(transitions) instead of O(bytes).
+	// Uniform-word checks use native-endian unsafe reads (0x00 and 0xFF words
+	// are endian-neutral). BigEndian conversion only happens for mixed words
+	// that need CLZ bit scanning.
+	fullWords := totalBlocks / 64
+	for wordIdx := uint64(0); wordIdx < fullWords; wordIdx++ {
+		byteOff := wordIdx * 8
+		var w uint64
+		if byteOff+8 <= bitmapLen {
+			w = *(*uint64)(unsafe.Pointer(&bitmap[byteOff]))
+		}
+		// else w = 0 (beyond bitmap, treat as zeros)
+
+		// fast path: uniform word (all 0 or all 1) — endian-neutral
+		if w == 0 || w == 0xFFFFFFFFFFFFFFFF {
 			runBit := byte(0)
-			if b == 0xFF {
+			if w != 0 {
 				runBit = 1
 			}
-			// count consecutive identical bytes — word-at-a-time
-			runBytes := uint64(1)
-			remaining := fullBytes - byteIdx - 1
-			scanBase := byteIdx + 1
-
-			// Use uint64 word scanning for long runs (8 bytes at a time)
-			if remaining >= 8 && scanBase < bitmapLen {
-				var wordTarget uint64
-				if b == 0xFF {
-					wordTarget = 0xFFFFFFFFFFFFFFFF
+			// scan ahead for more identical words using unsafe reads
+			runWords := uint64(1)
+			for wordIdx+runWords < fullWords {
+				nextOff := (wordIdx + runWords) * 8
+				var next uint64
+				if nextOff+8 <= bitmapLen {
+					next = *(*uint64)(unsafe.Pointer(&bitmap[nextOff]))
 				}
-				scanEnd := scanBase + remaining
-				if scanEnd > bitmapLen {
-					scanEnd = bitmapLen
-				}
-				for scanBase+runBytes+7 < scanEnd {
-					w := *(*uint64)(unsafe.Pointer(&bitmap[scanBase+runBytes]))
-					if w != wordTarget {
-						break
-					}
-					runBytes += 8
-				}
-			}
-
-			// finish byte-at-a-time for the tail
-			for byteIdx+runBytes < fullBytes {
-				var next byte
-				if byteIdx+runBytes < bitmapLen {
-					next = bitmap[byteIdx+runBytes]
-				}
-				if next != b {
+				if next != w {
 					break
 				}
-				runBytes++
+				runWords++
 			}
-			byteIdx += runBytes - 1 // outer loop increments
+			wordIdx += runWords - 1 // outer loop increments
 
 			if currentBit == runBit {
-				count += uint32(runBytes * 8)
+				count += uint32(runWords * 64)
 			} else {
 				dst = appendRun(dst, count, currentBit)
 				currentBit = runBit
-				count = uint32(runBytes * 8)
+				count = uint32(runWords * 64)
 			}
 			continue
 		}
 
-		// slow path: mixed byte — use CLZ to find runs in O(transitions) instead of O(8)
-		bitsLeft := uint(8)
+		// mixed word: convert to big-endian for MSB-first CLZ scanning
+		wBE := binary.BigEndian.Uint64(bitmap[byteOff:])
+		bitsLeft := uint(64)
 		for bitsLeft > 0 {
-			// Build a mask where matching bits are 0 and differing bits are 1,
-			// shifted so the remaining bits occupy the MSB of the byte.
-			var mask uint8
+			var mask uint64
 			if currentBit == 1 {
-				mask = 0xFF
+				mask = 0xFFFFFFFFFFFFFFFF
 			}
-			diff := (b << (8 - bitsLeft)) ^ mask
-			run := uint(bits.LeadingZeros8(diff))
+			diff := (wBE << (64 - bitsLeft)) ^ mask
+			run := uint(bits.LeadingZeros64(diff))
 			if run > bitsLeft {
 				run = bitsLeft
 			}
 			count += uint32(run)
 			bitsLeft -= run
 			if bitsLeft > 0 {
-				// transition: emit current run and flip
 				dst = appendRun(dst, count, currentBit)
 				currentBit ^= 1
 				count = 0
@@ -347,31 +326,36 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 		}
 	}
 
-	// handle remaining tail bits using CLZ to find runs in O(transitions)
+	// handle remaining tail bits (totalBlocks % 64)
+	tailBits := totalBlocks & 63
 	if tailBits > 0 {
-		var b byte
-		if fullBytes < uint64(len(bitmap)) {
-			b = bitmap[fullBytes]
+		startByte := fullWords * 8
+		// read available bytes into MSB of a uint64
+		var buf [8]byte
+		remainingBytes := (tailBits + 7) / 8
+		for i := uint64(0); i < remainingBytes && startByte+i < bitmapLen; i++ {
+			buf[i] = bitmap[startByte+i]
 		}
-		// Keep only the top tailBits bits; zero the rest so CLZ isn't confused.
-		b &= ^byte(0xFF >> tailBits)
-		// Process using progressive left-shift: data starts at MSB.
+		// zero out bits beyond tailBits in the last byte
+		if tailBits&7 != 0 {
+			buf[remainingBytes-1] &= ^byte(0xFF >> (tailBits & 7))
+		}
+		w := binary.BigEndian.Uint64(buf[:])
+
 		bitsLeft := uint(tailBits)
-		shifted := b
 		for bitsLeft > 0 {
-			var mask uint8
+			var mask uint64
 			if currentBit == 1 {
-				mask = 0xFF
+				mask = 0xFFFFFFFFFFFFFFFF
 			}
-			diff := shifted ^ mask
-			run := uint(bits.LeadingZeros8(diff))
+			diff := (w << (uint(tailBits) - bitsLeft)) ^ mask
+			run := uint(bits.LeadingZeros64(diff))
 			if run > bitsLeft {
 				run = bitsLeft
 			}
 			count += uint32(run)
 			bitsLeft -= run
 			if bitsLeft > 0 {
-				shifted <<= run
 				dst = appendRun(dst, count, currentBit)
 				currentBit ^= 1
 				count = 0
