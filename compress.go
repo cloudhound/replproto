@@ -1,8 +1,10 @@
 package replproto
 
 import (
+	"encoding/binary"
 	"fmt"
 
+	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/s2"
 )
 
@@ -12,25 +14,27 @@ const (
 	EncodingRaw byte = 0x04
 )
 
-// CompressBlock compresses src into dst using S2.
-// dst is reused if large enough, grown if not. The returned slice may
-// alias dst's underlying array — the caller should keep one dst buffer
-// and pass it to every call for zero-GC operation.
-//
-// returns (nil, nil) if the block is all zeros.
-func CompressBlock(dst, src []byte) ([]byte, error) {
+// CompressBlock compresses src into dst using S2 and computes the XXH64
+// checksum in a single pass over src. dst is reused if large enough.
+// returns (nil, zero-checksum, nil) if the block is all zeros.
+func CompressBlock(dst, src []byte) ([]byte, [ChecksumSize]byte, error) {
+	var checksum [ChecksumSize]byte
+
 	if IsZeroBlock(src) {
-		return dst[:0], nil
+		return dst[:0], checksum, nil
 	}
+
+	// compute checksum while we still have the uncompressed data
+	binary.BigEndian.PutUint64(checksum[:], xxhash.Sum64(src))
 
 	maxLen := s2.MaxEncodedLen(len(src))
 	if maxLen <= 0 {
-		// too large for S2 — store raw
+		// too large for S2 - store raw
 		needed := 1 + len(src)
 		dst = grow(dst, needed)
 		dst[0] = EncodingRaw
 		copy(dst[1:], src)
-		return dst[:needed], nil
+		return dst[:needed], checksum, nil
 	}
 
 	needed := 1 + maxLen
@@ -39,19 +43,19 @@ func CompressBlock(dst, src []byte) ([]byte, error) {
 	compressed := s2.Encode(dst[1:], src)
 
 	if len(compressed) >= len(src) {
-		// S2 expanded the data — store raw.
-		// dst already has cap >= 1+maxLen >= 1+len(src), so no regrow needed.
+		// S2 expanded the data - store raw
 		dst[0] = EncodingRaw
 		copy(dst[1:], src)
-		return dst[:1+len(src)], nil
+		return dst[:1+len(src)], checksum, nil
 	}
 
-	return dst[:1+len(compressed)], nil
+	return dst[:1+len(compressed)], checksum, nil
 }
 
-// DecompressBlock decompresses src into dst.
+// DecompressBlock decompresses src into dst and optionally verifies the
+// checksum. pass a zero checksum to skip verification.
 // dst is reused if large enough. The returned slice may alias dst.
-func DecompressBlock(dst, src []byte, uncompressedLen int) ([]byte, error) {
+func DecompressBlock(dst, src []byte, uncompressedLen int, checksum [ChecksumSize]byte) ([]byte, error) {
 	if uncompressedLen <= 0 || uncompressedLen > MaxDecompressedSize {
 		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
 	}
@@ -60,19 +64,37 @@ func DecompressBlock(dst, src []byte, uncompressedLen int) ([]byte, error) {
 		return nil, fmt.Errorf("empty compressed data")
 	}
 
+	var out []byte
+	var err error
+
 	switch src[0] {
 	case EncodingS2:
 		dst = grow(dst, uncompressedLen)
-		return s2.Decode(dst[:uncompressedLen], src[1:])
+		out, err = s2.Decode(dst[:uncompressedLen], src[1:])
+		if err != nil {
+			return nil, err
+		}
 
 	case EncodingRaw:
 		dst = grow(dst, uncompressedLen)
 		copy(dst, src[1:])
-		return dst[:uncompressedLen], nil
+		out = dst[:uncompressedLen]
 
 	default:
 		return nil, fmt.Errorf("unknown encoding tag: 0x%02X", src[0])
 	}
+
+	// verify checksum if non-zero
+	var zero [ChecksumSize]byte
+	if checksum != zero {
+		var actual [ChecksumSize]byte
+		binary.BigEndian.PutUint64(actual[:], xxhash.Sum64(out))
+		if actual != checksum {
+			return nil, fmt.Errorf("checksum mismatch")
+		}
+	}
+
+	return out, nil
 }
 
 // MaxDecompressedSize is the maximum allowed decompressed block size (16 MiB)
@@ -86,4 +108,3 @@ func grow(buf []byte, n int) []byte {
 	}
 	return make([]byte, n)
 }
-

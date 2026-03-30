@@ -47,7 +47,7 @@ func BenchmarkCompressBlock(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, _ = CompressBlock(dst, src)
+		dst, _, _ = CompressBlock(dst, src)
 	}
 }
 
@@ -58,20 +58,20 @@ func BenchmarkCompressBlockZero(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, _ = CompressBlock(dst, src)
+		dst, _, _ = CompressBlock(dst, src)
 	}
 }
 
 func BenchmarkDecompressBlock(b *testing.B) {
 	src := make([]byte, 4096)
 	rand.Read(src)
-	compressed, _ := CompressBlock(nil, src)
+	compressed, checksum, _ := CompressBlock(nil, src)
 	var dst []byte
 
 	b.SetBytes(int64(len(src)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, _ = DecompressBlock(dst, compressed, len(src))
+		dst, _ = DecompressBlock(dst, compressed, len(src), checksum)
 	}
 }
 
@@ -170,7 +170,7 @@ func BenchmarkEndToEnd(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// --- sender side ---
 				var err error
-				compBuf, err = CompressBlock(compBuf, src)
+				compBuf, _, err = CompressBlock(compBuf, src)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -190,7 +190,7 @@ func BenchmarkEndToEnd(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				decompBuf, err = DecompressBlock(decompBuf, compressed, size)
+				decompBuf, err = DecompressBlock(decompBuf, compressed, size, [8]byte{})
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -218,7 +218,7 @@ func BenchmarkEndToEndZero(b *testing.B) {
 	b.SetBytes(int64(size))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		compBuf, _ = CompressBlock(compBuf, src)
+		compBuf, _, _ = CompressBlock(compBuf, src)
 		if len(compBuf) == 0 {
 			// zero block — sender would skip, but measure the detect cost
 			continue
@@ -228,7 +228,7 @@ func BenchmarkEndToEndZero(b *testing.B) {
 		enc.EncodeFrame(&buf, Frame{Type: MsgBlockData, Payload: payloadBuf})
 		f, _ := dec.DecodeFrame(&buf)
 		_, compressed, _ := DecodeBlockDataPayload(f.Payload)
-		decompBuf, _ = DecompressBlock(decompBuf, compressed, size)
+		decompBuf, _ = DecompressBlock(decompBuf, compressed, size, [8]byte{})
 	}
 }
 

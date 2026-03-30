@@ -353,11 +353,11 @@ func TestCompressDecompressRoundTrip(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			compressed, err := CompressBlock(nil, tt.data)
+			compressed, checksum, err := CompressBlock(nil, tt.data)
 			if err != nil {
 				t.Fatalf("CompressBlock: %v", err)
 			}
-			decompressed, err := DecompressBlock(nil, compressed, len(tt.data))
+			decompressed, err := DecompressBlock(nil, compressed, len(tt.data), checksum)
 			if err != nil {
 				t.Fatalf("DecompressBlock: %v", err)
 			}
@@ -372,7 +372,7 @@ func TestCompressBlockZeroDetection(t *testing.T) {
 	for _, sz := range []int{1, 8, 32, 4096, 64 * 1024} {
 		t.Run(fmt.Sprintf("size=%d", sz), func(t *testing.T) {
 			src := make([]byte, sz)
-			compressed, err := CompressBlock(nil, src)
+			compressed, _, err := CompressBlock(nil, src)
 			if err != nil {
 				t.Fatalf("CompressBlock: %v", err)
 			}
@@ -387,10 +387,10 @@ func TestCompressBlockBufferReuse(t *testing.T) {
 	src1 := randBytes(4096)
 	src2 := randBytes(4096)
 
-	dst, _ := CompressBlock(nil, src1)
-	dst, _ = CompressBlock(dst, src2)
+	dst, _, _ := CompressBlock(nil, src1)
+	dst, checksum, _ := CompressBlock(dst, src2)
 
-	result, err := DecompressBlock(nil, dst, 4096)
+	result, err := DecompressBlock(nil, dst, 4096, checksum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,31 +401,31 @@ func TestCompressBlockBufferReuse(t *testing.T) {
 
 func TestDecompressBlockErrors(t *testing.T) {
 	t.Run("empty_src", func(t *testing.T) {
-		_, err := DecompressBlock(nil, nil, 100)
+		_, err := DecompressBlock(nil, nil, 100, [8]byte{})
 		if err == nil {
 			t.Fatal("expected error")
 		}
 	})
 	t.Run("invalid_length_zero", func(t *testing.T) {
-		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, 0)
+		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, 0, [8]byte{})
 		if err == nil {
 			t.Fatal("expected error")
 		}
 	})
 	t.Run("invalid_length_negative", func(t *testing.T) {
-		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, -1)
+		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, -1, [8]byte{})
 		if err == nil {
 			t.Fatal("expected error")
 		}
 	})
 	t.Run("too_large", func(t *testing.T) {
-		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, MaxDecompressedSize+1)
+		_, err := DecompressBlock(nil, []byte{EncodingRaw, 0x01}, MaxDecompressedSize+1, [8]byte{})
 		if err == nil {
 			t.Fatal("expected error")
 		}
 	})
 	t.Run("unknown_tag", func(t *testing.T) {
-		_, err := DecompressBlock(nil, []byte{0xFF, 0x01, 0x02}, 2)
+		_, err := DecompressBlock(nil, []byte{0xFF, 0x01, 0x02}, 2, [8]byte{})
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -435,12 +435,12 @@ func TestDecompressBlockErrors(t *testing.T) {
 func TestCompressBlockRawFallback(t *testing.T) {
 	// highly random data that S2 can't compress well
 	src := randBytes(4096)
-	compressed, err := CompressBlock(nil, src)
+	compressed, checksum, err := CompressBlock(nil, src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// regardless of encoding tag, round-trip must work
-	result, err := DecompressBlock(nil, compressed, len(src))
+	result, err := DecompressBlock(nil, compressed, len(src), checksum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +704,7 @@ func TestEndToEndBlockDataPipeline(t *testing.T) {
 			original := randBytes(sz)
 
 			// --- sender side ---
-			compressed, err := CompressBlock(nil, original)
+			compressed, checksum, err := CompressBlock(nil, original)
 			if err != nil {
 				t.Fatalf("CompressBlock: %v", err)
 			}
@@ -713,7 +713,7 @@ func TestEndToEndBlockDataPipeline(t *testing.T) {
 				DeviceID:        7,
 				BlockOffset:     12345678,
 				UncompressedLen: uint32(sz),
-				Checksum:        [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+				Checksum:        checksum,
 			}
 			payload := EncodeBlockDataPayload(nil, hdr, compressed)
 
@@ -741,7 +741,7 @@ func TestEndToEndBlockDataPipeline(t *testing.T) {
 				t.Errorf("header mismatch: got %+v, want %+v", gotHdr, hdr)
 			}
 
-			decompressed, err := DecompressBlock(nil, gotCompressed, int(gotHdr.UncompressedLen))
+			decompressed, err := DecompressBlock(nil, gotCompressed, int(gotHdr.UncompressedLen), gotHdr.Checksum)
 			if err != nil {
 				t.Fatalf("DecompressBlock: %v", err)
 			}
@@ -755,7 +755,7 @@ func TestEndToEndBlockDataPipeline(t *testing.T) {
 func TestEndToEndBlockDataZero(t *testing.T) {
 	original := make([]byte, 4096)
 
-	compressed, err := CompressBlock(nil, original)
+	compressed, _, err := CompressBlock(nil, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,7 +822,7 @@ func TestEndToEndMultiFrameStream(t *testing.T) {
 	rleData := EncodeBitmapRLE(bitmap, totalBlocks)
 
 	blockData := randBytes(4096)
-	compressed, _ := CompressBlock(nil, blockData)
+	compressed, _, _ := CompressBlock(nil, blockData)
 	hdr := BlockDataHeader{DeviceID: 1, BlockOffset: 0, UncompressedLen: 4096}
 	blockPayload := EncodeBlockDataPayload(nil, hdr, compressed)
 
@@ -889,7 +889,7 @@ func TestEndToEndCompressDecompressAllPatterns(t *testing.T) {
 
 	for _, p := range patterns {
 		t.Run(p.name, func(t *testing.T) {
-			compressed, err := CompressBlock(nil, p.data)
+			compressed, checksum, err := CompressBlock(nil, p.data)
 			if err != nil {
 				t.Fatalf("CompressBlock: %v", err)
 			}
@@ -902,7 +902,7 @@ func TestEndToEndCompressDecompressAllPatterns(t *testing.T) {
 				return
 			}
 
-			decompressed, err := DecompressBlock(nil, compressed, len(p.data))
+			decompressed, err := DecompressBlock(nil, compressed, len(p.data), checksum)
 			if err != nil {
 				t.Fatalf("DecompressBlock: %v", err)
 			}
@@ -918,7 +918,7 @@ func TestEndToEndLargeBlockWithFrame(t *testing.T) {
 	sz := 1 << 20
 	original := randBytes(sz)
 
-	compressed, err := CompressBlock(nil, original)
+	compressed, checksum, err := CompressBlock(nil, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,6 +927,7 @@ func TestEndToEndLargeBlockWithFrame(t *testing.T) {
 		DeviceID:        100,
 		BlockOffset:     999999,
 		UncompressedLen: uint32(sz),
+		Checksum:        checksum,
 	}
 	payload := EncodeBlockDataPayload(nil, hdr, compressed)
 
@@ -948,7 +949,7 @@ func TestEndToEndLargeBlockWithFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decompressed, err := DecompressBlock(nil, gotCompressed, int(gotHdr.UncompressedLen))
+	decompressed, err := DecompressBlock(nil, gotCompressed, int(gotHdr.UncompressedLen), gotHdr.Checksum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,10 +1317,10 @@ func TestDecompressBlockBufferReuse(t *testing.T) {
 	src1 := randBytes(4096)
 	src2 := randBytes(4096)
 
-	comp1, _ := CompressBlock(nil, src1)
-	comp2, _ := CompressBlock(nil, src2)
+	comp1, checksum1, _ := CompressBlock(nil, src1)
+	comp2, checksum2, _ := CompressBlock(nil, src2)
 
-	dst, err := DecompressBlock(nil, comp1, 4096)
+	dst, err := DecompressBlock(nil, comp1, 4096, checksum1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1329,7 @@ func TestDecompressBlockBufferReuse(t *testing.T) {
 	}
 
 	// reuse dst for second decompress
-	dst, err = DecompressBlock(dst, comp2, 4096)
+	dst, err = DecompressBlock(dst, comp2, 4096, checksum2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1344,7 +1345,7 @@ func TestDecompressBlockRawEncoding(t *testing.T) {
 	raw[0] = EncodingRaw
 	copy(raw[1:], src)
 
-	dst, err := DecompressBlock(nil, raw, len(src))
+	dst, err := DecompressBlock(nil, raw, len(src), [8]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
