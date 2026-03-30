@@ -15,6 +15,10 @@ import (
 // giving 10-20x speedup over the software-only IEEE polynomial.
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
+// bitMask[i] has the bit set at position i within a byte (MSB-first order).
+// Used in decode loops to avoid per-iteration shift calculations.
+var bitMask = [8]byte{0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01}
+
 // wire protocol constants
 const (
 	FrameMagic      = 0x434C4844 // "CLHD" - cloudhound replication
@@ -343,20 +347,34 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 		}
 	}
 
-	// handle remaining tail bits
+	// handle remaining tail bits using CLZ to find runs in O(transitions)
 	if tailBits > 0 {
 		var b byte
 		if fullBytes < uint64(len(bitmap)) {
 			b = bitmap[fullBytes]
 		}
-		for bitIdx := uint(7); bitIdx > 7-uint(tailBits); bitIdx-- {
-			bit := (b >> bitIdx) & 1
-			if bit == currentBit {
-				count++
-			} else {
+		// Keep only the top tailBits bits; zero the rest so CLZ isn't confused.
+		b &= ^byte(0xFF >> tailBits)
+		// Process using progressive left-shift: data starts at MSB.
+		bitsLeft := uint(tailBits)
+		shifted := b
+		for bitsLeft > 0 {
+			var mask uint8
+			if currentBit == 1 {
+				mask = 0xFF
+			}
+			diff := shifted ^ mask
+			run := uint(bits.LeadingZeros8(diff))
+			if run > bitsLeft {
+				run = bitsLeft
+			}
+			count += uint32(run)
+			bitsLeft -= run
+			if bitsLeft > 0 {
+				shifted <<= run
 				dst = appendRun(dst, count, currentBit)
-				currentBit = bit
-				count = 1
+				currentBit ^= 1
+				count = 0
 			}
 		}
 	}
@@ -411,12 +429,13 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			fillByte = 0xFF
 		}
 
-		// handle unaligned leading bits
+		// handle unaligned leading bits using precomputed masks
 		for pos < end && (pos&7) != 0 {
+			m := bitMask[pos&7]
 			if value != 0 {
-				bitmap[pos>>3] |= 1 << (7 - (pos & 7))
+				bitmap[pos>>3] |= m
 			} else {
-				bitmap[pos>>3] &^= 1 << (7 - (pos & 7))
+				bitmap[pos>>3] &^= m
 			}
 			pos++
 		}
@@ -429,20 +448,27 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			pos += fillBytes * 8
 		}
 
-		// handle unaligned trailing bits
+		// handle unaligned trailing bits using precomputed masks
 		for pos < end {
+			m := bitMask[pos&7]
 			if value != 0 {
-				bitmap[pos>>3] |= 1 << (7 - (pos & 7))
+				bitmap[pos>>3] |= m
 			} else {
-				bitmap[pos>>3] &^= 1 << (7 - (pos & 7))
+				bitmap[pos>>3] &^= m
 			}
 			pos++
 		}
 	}
 
-	// zero any remaining bytes beyond the last run
+	// zero any remaining bits/bytes beyond the last run
 	if pos < totalBlocks {
-		startByte := (pos + 7) / 8
+		// clear individual bits in the partial byte at pos
+		for pos < totalBlocks && (pos&7) != 0 {
+			bitmap[pos>>3] &^= bitMask[pos&7]
+			pos++
+		}
+		// bulk zero remaining whole bytes
+		startByte := pos >> 3
 		if startByte < uint64(len(bitmap)) {
 			memset(bitmap[startByte:], 0)
 		}
