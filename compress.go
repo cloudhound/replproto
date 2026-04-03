@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/s2"
 )
 
@@ -31,7 +30,7 @@ func CompressBlock(dst, src []byte, checksum ...[ChecksumSize]byte) ([]byte, [Ch
 	// compute checksum if not provided
 	var zero [ChecksumSize]byte
 	if cs == zero {
-		binary.BigEndian.PutUint64(cs[:], xxhash.Sum64(src))
+		binary.BigEndian.PutUint64(cs[:], xxh64Sum(src))
 	}
 
 	maxLen := s2.MaxEncodedLen(len(src))
@@ -95,7 +94,7 @@ func DecompressBlock(dst, src []byte, uncompressedLen int, checksum [ChecksumSiz
 	var zero [ChecksumSize]byte
 	if checksum != zero {
 		var actual [ChecksumSize]byte
-		binary.BigEndian.PutUint64(actual[:], xxhash.Sum64(out))
+		binary.BigEndian.PutUint64(actual[:], xxh64Sum(out))
 		if actual != checksum {
 			return nil, fmt.Errorf("checksum mismatch")
 		}

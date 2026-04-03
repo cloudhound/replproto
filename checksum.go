@@ -1,10 +1,6 @@
 package replproto
 
-import (
-	"encoding/binary"
-
-	xxhash "github.com/cespare/xxhash/v2"
-)
+import "encoding/binary"
 
 // ChecksumSize is the size of a block checksum in bytes (XXH64 = 8 bytes).
 const ChecksumSize = 8
@@ -13,6 +9,6 @@ const ChecksumSize = 8
 // returned as a big-endian 8-byte array matching the wire format.
 func BlockChecksum(data []byte) [8]byte {
 	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], xxhash.Sum64(data))
+	binary.BigEndian.PutUint64(b[:], xxh64Sum(data))
 	return b
 }

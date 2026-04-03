@@ -1,0 +1,37 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.20"
+
+      - name: Verify architecture
+        run: go env GOARCH | grep -q ${{ matrix.arch }}
+
+      - name: Test
+        run: go test -v -count=1 ./...
+
+      - name: Benchmark
+        run: go test -bench=. -benchmem -count=1 -run=^$ ./...
