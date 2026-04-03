@@ -16,15 +16,17 @@ const (
 // CompressBlock compresses src into dst using S2 and computes the XXH64
 // checksum in a single pass over src. dst is reused if large enough.
 // if checksum is non-zero it is used as-is (caller already computed it).
-// returns (nil, zero-checksum, nil) if the block is all zeros.
+// returns (nil, zero-checksum, nil) if the block is all zeros — both
+// hashing and compression are skipped entirely for zero blocks.
 func CompressBlock(dst, src []byte, checksum ...[ChecksumSize]byte) ([]byte, [ChecksumSize]byte, error) {
 	var cs [ChecksumSize]byte
-	if len(checksum) > 0 {
-		cs = checksum[0]
-	}
 
 	if IsZeroBlock(src) {
 		return dst[:0], cs, nil
+	}
+
+	if len(checksum) > 0 {
+		cs = checksum[0]
 	}
 
 	// compute checksum if not provided
@@ -66,8 +68,11 @@ func DecompressBlock(dst, src []byte, uncompressedLen int, checksum [ChecksumSiz
 		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
 	}
 
-	if len(src) < 1 {
-		return nil, fmt.Errorf("empty compressed data")
+	// zero block: empty compressed payload → fill with zeros, skip hash check
+	if len(src) == 0 {
+		dst = grow(dst, uncompressedLen)
+		memset(dst[:uncompressedLen], 0)
+		return dst[:uncompressedLen], nil
 	}
 
 	var out []byte

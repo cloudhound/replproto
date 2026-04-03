@@ -400,10 +400,28 @@ func TestCompressBlockBufferReuse(t *testing.T) {
 }
 
 func TestDecompressBlockErrors(t *testing.T) {
-	t.Run("empty_src", func(t *testing.T) {
-		_, err := DecompressBlock(nil, nil, 100, [8]byte{})
-		if err == nil {
-			t.Fatal("expected error")
+	t.Run("nil_src_zero_block", func(t *testing.T) {
+		out, err := DecompressBlock(nil, nil, 100, [8]byte{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(out) != 100 {
+			t.Fatalf("expected len=100, got %d", len(out))
+		}
+		if !IsZeroBlock(out) {
+			t.Fatal("expected all zeros")
+		}
+	})
+	t.Run("empty_src_zero_block", func(t *testing.T) {
+		out, err := DecompressBlock(nil, []byte{}, 4096, [8]byte{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(out) != 4096 {
+			t.Fatalf("expected len=4096, got %d", len(out))
+		}
+		if !IsZeroBlock(out) {
+			t.Fatal("expected all zeros")
 		}
 	})
 	t.Run("invalid_length_zero", func(t *testing.T) {
@@ -755,13 +773,25 @@ func TestEndToEndBlockDataPipeline(t *testing.T) {
 func TestEndToEndBlockDataZero(t *testing.T) {
 	original := make([]byte, 4096)
 
-	compressed, _, err := CompressBlock(nil, original)
+	compressed, checksum, err := CompressBlock(nil, original)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// zero blocks produce empty compressed output
+	// zero blocks produce empty compressed output and zero checksum
 	if len(compressed) != 0 {
 		t.Fatalf("expected empty compressed for zero block, got len=%d", len(compressed))
+	}
+	if checksum != ([8]byte{}) {
+		t.Fatalf("expected zero checksum for zero block, got %x", checksum)
+	}
+
+	// full round-trip: decompress the zero block
+	decompressed, err := DecompressBlock(nil, compressed, len(original), checksum)
+	if err != nil {
+		t.Fatalf("DecompressBlock: %v", err)
+	}
+	if !bytes.Equal(decompressed, original) {
+		t.Error("round-trip mismatch for zero block")
 	}
 }
 
