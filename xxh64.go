@@ -1,5 +1,3 @@
-//go:build !arm64
-
 package replproto
 
 import xxhash "github.com/cespare/xxhash/v2"
