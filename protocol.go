@@ -161,12 +161,18 @@ func (d *FrameDecoder) DecodeFrame(r io.Reader) (Frame, error) {
 		d.buf = d.buf[:needed]
 	}
 
+	// ReadFull guarantees exactly 'needed' bytes or an error - no partial
+	// reads, no stale buffer data, no truncated CRC. the reused buffer is
+	// fully overwritten on every frame
 	if _, err := io.ReadFull(r, d.buf); err != nil {
 		return Frame{}, fmt.Errorf("read payload: %w", err)
 	}
 
-	// verify crc32-c over header + payload using a single pass
-	// by checksumming the contiguous header, then continuing into payload
+	// verify crc32-c over header + payload using a single pass.
+	// layout: buf[:payloadLen] is payload, buf[payloadLen:] is CRC -
+	// the CRC is NOT included in the checksum input (no self-reference).
+	// payloadLen is uint32 used as slice index - safe because we only
+	// target 64-bit linux where int is 64 bits (no truncation)
 	crcVal := crc32.Update(0, castagnoliTable, d.header[:])
 	expected := crc32.Update(crcVal, castagnoliTable, d.buf[:payloadLen])
 	got := binary.BigEndian.Uint32(d.buf[payloadLen:])
@@ -435,7 +441,9 @@ func DecodeBitmapRLETo(dst, data []byte, totalBlocks uint64) ([]byte, error) {
 			pos++
 		}
 
-		// bulk fill aligned whole bytes using page-copy memset
+		// bulk fill aligned whole bytes using page-copy memset.
+		// uint64 indices are safe: max bitmap ~32 MiB (256 TiB / 1 MiB
+		// blocksize / 8), well within int range on 64-bit targets
 		if pos+8 <= end {
 			startByte := pos >> 3
 			fillBytes := (end - pos) >> 3
