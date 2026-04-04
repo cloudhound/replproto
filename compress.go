@@ -87,6 +87,9 @@ func DecompressBlock(dst, src []byte, uncompressedLen int, checksum [ChecksumSiz
 		}
 
 	case EncodingRaw:
+		if len(src)-1 != uncompressedLen {
+			return nil, fmt.Errorf("raw block size mismatch: payload %d, expected %d", len(src)-1, uncompressedLen)
+		}
 		dst = grow(dst, uncompressedLen)
 		copy(dst, src[1:])
 		out = dst[:uncompressedLen]
