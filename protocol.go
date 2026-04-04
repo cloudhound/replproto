@@ -256,7 +256,7 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 	}
 
 	currentBit := (bitmap[0] >> 7) & 1
-	count := uint32(0)
+	count := uint64(0)
 	bitmapLen := uint64(len(bitmap))
 
 	// Process in 64-bit (8-byte) words for O(transitions) instead of O(bytes).
@@ -294,11 +294,11 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			wordIdx += runWords - 1 // outer loop increments
 
 			if currentBit == runBit {
-				count += uint32(runWords * 64)
+				count += runWords * 64
 			} else {
-				dst = appendRun(dst, count, currentBit)
+				dst = appendRunLarge(dst, count, currentBit)
 				currentBit = runBit
-				count = uint32(runWords * 64)
+				count = runWords * 64
 			}
 			continue
 		}
@@ -316,10 +316,10 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			if run > bitsLeft {
 				run = bitsLeft
 			}
-			count += uint32(run)
+			count += uint64(run)
 			bitsLeft -= run
 			if bitsLeft > 0 {
-				dst = appendRun(dst, count, currentBit)
+				dst = appendRunLarge(dst, count, currentBit)
 				currentBit ^= 1
 				count = 0
 			}
@@ -353,10 +353,10 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 			if run > bitsLeft {
 				run = bitsLeft
 			}
-			count += uint32(run)
+			count += uint64(run)
 			bitsLeft -= run
 			if bitsLeft > 0 {
-				dst = appendRun(dst, count, currentBit)
+				dst = appendRunLarge(dst, count, currentBit)
 				currentBit ^= 1
 				count = 0
 			}
@@ -365,10 +365,21 @@ func AppendBitmapRLE(dst, bitmap []byte, totalBlocks uint64) []byte {
 
 	// flush final run
 	if count > 0 {
-		dst = appendRun(dst, count, currentBit)
+		dst = appendRunLarge(dst, count, currentBit)
 	}
 
 	return dst
+}
+
+// appendRunLarge handles counts that may exceed uint32. counts larger than
+// MaxUint32 are split into multiple consecutive same-bit runs which the
+// decoder handles naturally by accumulating offsets.
+func appendRunLarge(dst []byte, count uint64, value byte) []byte {
+	for count > 0xFFFFFFFF {
+		dst = appendRun(dst, 0xFFFFFFFF, value)
+		count -= 0xFFFFFFFF
+	}
+	return appendRun(dst, uint32(count), value)
 }
 
 // appendRun appends a 5-byte RLE run (count + value) to dst.
