@@ -68,8 +68,14 @@ func DecompressBlock(dst, src []byte, uncompressedLen int, checksum [ChecksumSiz
 		return nil, fmt.Errorf("invalid uncompressed length: %d (max %d)", uncompressedLen, MaxDecompressedSize)
 	}
 
-	// zero block: empty compressed payload → fill with zeros, skip hash check
+	// zero block: empty compressed payload → fill with zeros
 	if len(src) == 0 {
+		// verify the checksum is also zero - a non-zero checksum with empty
+		// payload means the original block was not zero and corruption occurred
+		var zero [ChecksumSize]byte
+		if checksum != zero {
+			return nil, fmt.Errorf("checksum mismatch: non-zero checksum on zero block")
+		}
 		dst = grow(dst, uncompressedLen)
 		memset(dst[:uncompressedLen], 0)
 		return dst[:uncompressedLen], nil
